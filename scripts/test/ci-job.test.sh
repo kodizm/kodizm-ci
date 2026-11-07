@@ -648,4 +648,32 @@ if grep -q 'author:' "$work/sync.out"; then
 fi
 pass 'sync-neutral-images refuses a source carrying an owner string'
 
+# 10. A fetch that meets a transient refusal (a 429 or a 5xx from GitHub or the
+# Worker) is tried again after a growing pause, three tries in all; a refusal
+# that lasts fails the job.
+fetch_attempts="$work/fetch-attempts"
+fetch_failures=2
+git_with_token() {
+    echo "$*" >>"$fetch_attempts"
+    [ "$(wc -l <"$fetch_attempts")" -gt "$fetch_failures" ]
+}
+sleep() {
+    echo "$1" >>"$work/slept"
+}
+fetch_commit "$(printf 'a%.0s' {1..40})" || fail 'a fetch that fails twice then succeeds was given up'
+[ "$(wc -l <"$fetch_attempts")" -eq 3 ] || fail "the fetch ran $(wc -l <"$fetch_attempts") times, not 3"
+[ "$(paste -sd, "$work/slept")" = "$((CI_FETCH_BACKOFF_SECONDS)),$((CI_FETCH_BACKOFF_SECONDS * 2))" ] \
+    || fail "the pauses were $(paste -sd, "$work/slept")"
+grep -q -- '--depth=1 origin a\{40\}$' "$fetch_attempts" || fail 'the retried fetch lost its arguments'
+pass 'a transient fetch failure is retried with a growing pause'
+
+rm -f "$fetch_attempts" "$work/slept"
+fetch_failures=9
+if fetch_commit "$(printf 'b%.0s' {1..40})"; then
+    fail 'a fetch that keeps failing succeeded'
+fi
+[ "$(wc -l <"$fetch_attempts")" -eq 3 ] || fail 'a lasting refusal was tried more than three times'
+pass 'a lasting fetch failure gives up after three tries'
+unset -f git_with_token sleep
+
 echo 'PASS ci-job.test.sh'

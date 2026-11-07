@@ -55,6 +55,8 @@ cache="$root/cache"
 changed_files="$root/changed-files"
 scope_file="$root/scope-script"
 sandbox_uid=2000
+# Pause before a fetch's second try; the third waits twice as long.
+CI_FETCH_BACKOFF_SECONDS="${CI_FETCH_BACKOFF_SECONDS:-5}"
 api="${CI_API:-}"
 api="${api%/}"
 token_audience="${CI_TOKEN_AUDIENCE:-}"
@@ -767,6 +769,24 @@ git_with_token() {
     fi
 }
 
+# One commit at depth 1. GitHub and the Worker's edge refuse a burst now and
+# then with a 429 or a 5xx; three tries with a growing pause outlast it, and a
+# refusal that lasts still fails the job.
+fetch_commit() {
+    local try
+
+    for try in 1 2 3; do
+        if git_with_token fetch --quiet --no-tags --depth=1 origin "$1"; then
+            return 0
+        fi
+        if [ "$try" -lt 3 ]; then
+            sleep "$((CI_FETCH_BACKOFF_SECONDS * try))"
+        fi
+    done
+
+    return 1
+}
+
 fetch_source() {
     if [ "$git_proxy" != true ]; then
         cat >"$secret/askpass" <<'SH'
@@ -779,7 +799,7 @@ SH
         chmod 0700 "$secret/askpass"
     fi
 
-    if ! git_with_token fetch --quiet --no-tags --depth=1 origin "$head_sha"; then
+    if ! fetch_commit "$head_sha"; then
         say 'fetching the head commit failed'
         return 1
     fi
@@ -788,7 +808,7 @@ SH
     # The scope script diffs two trees, so it needs the base too; without one
     # it runs everything, the same as ci.yml.
     if [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] && [[ ! "$base_sha" =~ ^0+$ ]] && [ "$base_sha" != "$head_sha" ]; then
-        if ! git_with_token fetch --quiet --no-tags --depth=1 origin "$base_sha"; then
+        if ! fetch_commit "$base_sha"; then
             base_sha=''
         fi
     fi
