@@ -354,6 +354,45 @@ collect() {
     if ! summarise "$kind" "$copy"; then
         write_empty_summary
     fi
+
+    if [ "$kind" = junit ]; then
+        class_timings "$copy"
+    fi
+}
+
+# Writes each test class's summed seconds, slowest first, to the root-only
+# timings log, which upload_logs sends with the rest. The shard split is
+# judged by these figures, never by test counts. An unreadable report writes
+# nothing: the timings are evidence, never part of the verdict.
+class_timings() {
+    php -d memory_limit=1G -- "$1" >"$state/timings.tmp" <<'PHP' || true
+<?php
+
+$xml = simplexml_load_file($argv[1], null, LIBXML_NONET | LIBXML_NOERROR | LIBXML_NOWARNING);
+
+if ($xml === false) {
+    exit(1);
+}
+
+$seconds = [];
+
+foreach ($xml->xpath('//testcase') ?: [] as $case) {
+    $class = (string) $case['class'];
+    $seconds[$class] = ($seconds[$class] ?? 0.0) + (float) $case['time'];
+}
+
+arsort($seconds);
+
+foreach ($seconds as $class => $total) {
+    printf("%.3f %s\n", $total, $class);
+}
+PHP
+
+    if [ -s "$state/timings.tmp" ]; then
+        mv "$state/timings.tmp" "$state/timings.log"
+    else
+        rm -f "$state/timings.tmp"
+    fi
 }
 
 # Summarises the first report a command left in CI_REPORT_DIR. The existence
@@ -1157,7 +1196,9 @@ run_test() {
         full)
             args=(artisan test --parallel --processes=4 --compact)
             if [ "$shards" -gt 1 ]; then
-                args+=("--shard=$shard/$shards" --shard-test-distribution=sequential)
+                # Round-robin deals the classes out one by one, so a directory of
+                # slow feature tests spreads over every shard instead of filling one.
+                args+=("--shard=$shard/$shards" --shard-test-distribution=round-robin)
             fi
             ;;
     esac

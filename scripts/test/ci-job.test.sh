@@ -138,6 +138,43 @@ if ! jq -e '.ci_run_id == "01234567-89ab-cdef-0123-456789abcdef" and .status == 
 fi
 pass 'payload carries the run id and the status'
 
+# The private log gets each test class's summed seconds, slowest first, so
+# the shard split can be measured against real class durations.
+report="$work/junit.xml"
+cat >"$report" <<XML
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="" tests="4" time="4.75">
+    <testsuite name="Tests\\Unit\\FastTest" file="$tree/tests/Unit/FastTest.php" tests="1" time="0.25">
+      <testcase name="test_a" class="Tests\\Unit\\FastTest" file="$tree/tests/Unit/FastTest.php" line="9" time="0.25"/>
+    </testsuite>
+    <testsuite name="Tests\\Feature\\SlowTest" file="$tree/tests/Feature/SlowTest.php" tests="2" time="3.5">
+      <testcase name="test_b" class="Tests\\Feature\\SlowTest" file="$tree/tests/Feature/SlowTest.php" line="9" time="1.5"/>
+      <testcase name="test_c" class="Tests\\Feature\\SlowTest" file="$tree/tests/Feature/SlowTest.php" line="19" time="2"/>
+    </testsuite>
+    <testsuite name="Tests\\Unit\\MidTest" file="$tree/tests/Unit/MidTest.php" tests="1" time="1">
+      <testcase name="test_d" class="Tests\\Unit\\MidTest" file="$tree/tests/Unit/MidTest.php" line="9" time="1"/>
+    </testsuite>
+  </testsuite>
+</testsuites>
+XML
+
+rm -f "$state/timings.log"
+class_timings "$report"
+expected=$'3.500 Tests\\Feature\\SlowTest\n1.000 Tests\\Unit\\MidTest\n0.250 Tests\\Unit\\FastTest'
+if [ "$(cat "$state/timings.log")" != "$expected" ]; then
+    fail "class timings are $(cat "$state/timings.log")"
+fi
+pass 'class timings sum each class, slowest first'
+
+printf 'not xml' >"$report"
+rm -f "$state/timings.log"
+class_timings "$report"
+if [ -e "$state/timings.log" ]; then
+    fail 'an unreadable report left a timings log'
+fi
+pass 'an unreadable report leaves no timings log'
+
 # 3. The scope script in pr mode is the base commit's, never the head's: a
 #    pull request must not be able to rewrite the rules that judge it.
 tree="$work/repo"
