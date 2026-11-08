@@ -45,6 +45,53 @@ if ($path === '/reject') {
     return true;
 }
 
+// /gateway answers 502 four times, past the old three-retry limit, then 200; /landed answers 502 and then 409,
+// as a server does when the first attempt was stored and only its answer was lost; /broken always answers 500.
+$calls = static function (string $name) use ($state): int {
+    $file = "{$state}/{$name}.count";
+    $seen = is_file($file) ? (int) file_get_contents($file) : 0;
+    file_put_contents($file, (string) ($seen + 1));
+
+    return $seen;
+};
+
+if ($path === '/gateway') {
+    http_response_code($calls('gateway') < 4 ? 502 : 200);
+    echo '{"ok":true}';
+
+    return true;
+}
+
+if ($path === '/landed') {
+    http_response_code($calls('landed') === 0 ? 502 : 409);
+    echo '{"error":{"code":"replayed"}}';
+
+    return true;
+}
+
+if ($path === '/conflict') {
+    http_response_code(409);
+    echo '{"error":{"code":"replayed"}}';
+
+    return true;
+}
+
+if ($path === '/down') {
+    $calls('down');
+    http_response_code(502);
+    echo '{"error":{"code":"down"}}';
+
+    return true;
+}
+
+if ($path === '/broken') {
+    $calls('broken');
+    http_response_code(500);
+    echo '{"error":{"code":"broken"}}';
+
+    return true;
+}
+
 $counter = "{$state}/sequence.count";
 $seen = is_file($counter) ? (int) file_get_contents($counter) : 0;
 file_put_contents($counter, (string) ($seen + 1));

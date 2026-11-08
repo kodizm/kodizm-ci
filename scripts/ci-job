@@ -91,8 +91,19 @@ sandboxed() {
     local workdir="$2"
     shift 2
 
+    local started="${EPOCHREALTIME/,/.}"
+    local code=0
+
     last_log="$name"
-    ci-sandbox "${flags[@]}" "$state/$name.log" "$workdir" "${sandbox_env[@]}" "$@"
+    ci-sandbox "${flags[@]}" "$state/$name.log" "$workdir" "${sandbox_env[@]}" "$@" || code=$?
+
+    # The private logs say where a job's minutes went; the public one stays silent. A separate file, because
+    # some logs are data (changed-files.log becomes CI_CHANGED_FILES). EPOCHREALTIME and awk follow the
+    # locale's decimal mark, so both are pinned to a dot.
+    LC_ALL=C awk -v name="$name" -v from="$started" -v to="${EPOCHREALTIME/,/.}" \
+        'BEGIN { printf "%s took %.1f s\n", name, to - from }' >>"$state/durations.log"
+
+    return "$code"
 }
 
 # Prints the real path of <dir> inside <tree>, or fails for an absolute path,
@@ -178,7 +189,10 @@ revoke_token() {
         url="$api/gh-token"
     fi
 
-    if ! ci-post -X DELETE "$url" "$secret/github.curl" "$state/revoke.json"; then
+    # A 401 means the token no longer works, which is the point: a retried DELETE whose first attempt landed
+    # meets exactly that. The Worker answers a bad ticket with 404, so that case still fails.
+    if ! ci-post -X DELETE "$url" "$secret/github.curl" "$state/revoke.json" \
+        && [ "$(http_status "$state/revoke.json")" != 401 ]; then
         revoked=false
     fi
 
@@ -239,11 +253,31 @@ if ($kind === 'junit') {
         exit(1);
     }
 
+    $slow = [];
+    $classes = [];
+
     foreach ($xml->xpath('//testcase') ?: [] as $case) {
         $summary['counts']['tests']++;
         $name = trim($case['class'].'::'.$case['name'], ':');
         $path = $relative((string) $case['file']);
         $line = (int) $case['line'];
+        $seconds = max(0.0, (float) $case['time']);
+        $class = (string) $case['class'];
+
+        // The server refuses a key that is not a class name, which would cost the whole result.
+        if (preg_match('/^[A-Za-z_\\\\][A-Za-z0-9_\\\\]{0,254}$/', $class) === 1) {
+            $classes[$class] = ($classes[$class] ?? 0.0) + $seconds;
+        }
+
+        // The server requires a name; an unnamed entry would cost the whole result.
+        if ($seconds >= 2.0 && $name !== '') {
+            $slow[] = [
+                'name' => mb_substr($name, 0, 500),
+                'file' => mb_substr($path, 0, 500),
+                'line' => max(0, $line),
+                'seconds' => round($seconds, 3),
+            ];
+        }
 
         if (isset($case->failure)) {
             $summary['counts']['failures']++;
@@ -255,6 +289,15 @@ if ($kind === 'junit') {
             $summary['counts']['skipped']++;
         }
     }
+
+    usort($slow, static fn (array $a, array $b): int => $b['seconds'] <=> $a['seconds']);
+    arsort($classes);
+
+    $summary['slow_tests'] = array_slice($slow, 0, 50);
+    $summary['class_timings'] = (object) array_map(
+        static fn (float $total): float => round($total, 3),
+        array_slice($classes, 0, 5000, true),
+    );
 }
 
 if ($kind === 'pint') {
@@ -281,6 +324,7 @@ if ($kind === 'flutter') {
     $suites = [];
     $tests = [];
     $errors = [];
+    $slow = [];
     $path = static fn (mixed $url): string => $relative(rawurldecode(preg_replace('#^file://#', '', (string) $url)));
 
     while (($line = fgets($handle)) !== false) {
@@ -301,6 +345,7 @@ if ($kind === 'flutter') {
                 'file' => $path($url),
                 'line' => (int) ($test['root_line'] ?? $test['line'] ?? 0),
                 'name' => str_replace($prefix, '', (string) ($test['name'] ?? '')),
+                'started' => (int) ($event['time'] ?? 0),
             ];
         } elseif ($type === 'error') {
             $errors[(int) ($event['testID'] ?? -1)][] = trim(
@@ -315,8 +360,20 @@ if ($kind === 'flutter') {
             }
 
             $summary['counts']['tests']++;
-            $test = $tests[$id] ?? ['file' => '', 'line' => 0, 'name' => ''];
+            $test = $tests[$id] ?? ['file' => '', 'line' => 0, 'name' => '', 'started' => null];
             $message = implode("\n\n", $errors[$id] ?? []);
+
+            // The reporter's times are milliseconds since the run started.
+            $seconds = $test['started'] === null ? 0.0 : max(0, (int) ($event['time'] ?? 0) - $test['started']) / 1000;
+
+            if ($seconds >= 2.0 && $test['name'] !== '') {
+                $slow[] = [
+                    'name' => mb_substr($test['name'], 0, 500),
+                    'file' => mb_substr($test['file'], 0, 500),
+                    'line' => max(0, $test['line']),
+                    'seconds' => round($seconds, 3),
+                ];
+            }
 
             if (($event['skipped'] ?? false) === true) {
                 $summary['counts']['skipped']++;
@@ -331,6 +388,9 @@ if ($kind === 'flutter') {
     }
 
     fclose($handle);
+
+    usort($slow, static fn (array $a, array $b): int => $b['seconds'] <=> $a['seconds']);
+    $summary['slow_tests'] = array_slice($slow, 0, 50);
 }
 
 echo json_encode($summary, JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
@@ -393,6 +453,93 @@ PHP
     else
         rm -f "$state/timings.tmp"
     fi
+}
+
+# usage: plan_shard <list-tests output> <timings json> <shard> <shards>
+# Prints the PHPUnit --filter that selects this shard's classes. Every shard
+# computes the same plan from the same listing and timings: the classes the
+# listing names, slowest first, each onto the least loaded shard (ties to the
+# lower shard). A class without a timing counts as the median of the listed
+# ones; a timed class the listing lacks is gone and is skipped. Fails when the
+# listing names no class or the timings are unreadable, so the caller falls
+# back to round-robin. Data only, like summarise.
+plan_shard() {
+    php -d memory_limit=1G -- "$1" "$2" "$3" "$4" <<'PHP'
+<?php
+
+[, $listFile, $timingsFile, $shard, $shards] = $argv;
+$shard = (int) $shard;
+$shards = (int) $shards;
+
+$listing = @file($listFile, FILE_IGNORE_NEW_LINES);
+$timings = json_decode((string) @file_get_contents($timingsFile), true);
+
+if ($listing === false || ! is_array($timings) || $shard < 1 || $shard > $shards) {
+    exit(1);
+}
+
+$classes = [];
+
+foreach ($listing as $line) {
+    if (preg_match('/^ - ([A-Za-z_\\\\][A-Za-z0-9_\\\\]*)::/', $line, $match) === 1) {
+        $classes[$match[1]] = true;
+    }
+}
+
+if ($classes === []) {
+    exit(1);
+}
+
+$known = [];
+
+foreach (array_keys($classes) as $class) {
+    if (isset($timings[$class]) && is_numeric($timings[$class])) {
+        $known[$class] = max(0.0, (float) $timings[$class]);
+    }
+}
+
+$sorted = array_values($known);
+sort($sorted);
+$count = count($sorted);
+$median = $count === 0 ? 1.0 : ($count % 2 === 1
+    ? $sorted[intdiv($count, 2)]
+    : ($sorted[$count / 2 - 1] + $sorted[$count / 2]) / 2);
+
+$weights = [];
+
+foreach (array_keys($classes) as $class) {
+    $weights[] = [$class, $known[$class] ?? $median];
+}
+
+// Slowest first; equal weights keep the listing order, so the plan is stable.
+usort($weights, static fn (array $a, array $b): int => $b[1] <=> $a[1]);
+
+$load = array_fill(0, $shards, 0.0);
+$plan = array_fill(0, $shards, []);
+
+foreach ($weights as [$class, $weight]) {
+    $target = array_keys($load, min($load))[0];
+    $load[$target] += $weight;
+    $plan[$target][] = preg_quote($class, '{');
+}
+
+// Every shard's filter is built and compiled, not only this one: PCRE refuses a pattern past its size limit
+// (two shards of a large suite), and PHPUnit would then silently run nothing. Every shard reaches the same
+// verdict, so they all fall back together.
+$filters = [];
+
+foreach ($plan as $classes) {
+    $filter = '{^(?:'.implode('|', $classes).')::}';
+
+    if ($classes === [] || @preg_match($filter, '') === false) {
+        exit(1);
+    }
+
+    $filters[] = $filter;
+}
+
+echo $filters[$shard - 1];
+PHP
 }
 
 # Summarises the first report a command left in CI_REPORT_DIR. The existence
@@ -503,6 +650,11 @@ build_payload() {
                 failures: ($failures[:$max_failures] | map(.message |= .[:$max_message])),
                 annotations: ($s.annotations[:$max_annotations] | map(.message |= .[:$max_message])),
             }
+            # Evidence, never the verdict: the last tier drops them with the failures.
+            + (if $max_failures > 0 and ($s.slow_tests // [] | length) > 0
+                then {slow_tests: $s.slow_tests} else {} end)
+            + (if $max_failures > 0 and ($s.class_timings // {} | length) > 0
+                then {class_timings: $s.class_timings} else {} end)
         ' >"$state/results.json"
 
         if [ "$(wc -c <"$state/results.json")" -le 524288 ]; then
@@ -717,6 +869,16 @@ exchange_token() {
         say "the token response has an unexpected shape ($bad)"
         return 1
     fi
+
+    # The last passed run's class timings, for the shard plan; a malformed entry is dropped, never trusted.
+    jq '
+        .class_timings // {}
+        | if type == "object" then . else {} end
+        | with_entries(select(
+            (.key | test("^[A-Za-z_\\\\][A-Za-z0-9_\\\\]{0,254}$"))
+            and (.value | type == "number" and . >= 0)
+        ))
+    ' "$secret/token.json" >"$state/class-timings.json"
 
     jq -j '.token' "$secret/token.json" >"$secret/github-token"
     jq -r '
@@ -1164,6 +1326,44 @@ run_warm() {
     fi
 }
 
+# Sets shard_args to this shard's selection and shard_mode to how it was
+# chosen. Every shard of a run must pick the same partition, or a class could
+# run nowhere:
+#   - no class timings: round-robin, as every shard sees the same response;
+#   - timings, but this shard's listing failed: the whole suite (shard_mode
+#     whole), because the other shards may have planned by duration, and a
+#     repeated test is cheaper than a skipped one;
+#   - timings and a listing: plan_shard decides from data every shard shares,
+#     so a refusal (a filter too large to compile, too few classes) is the same
+#     on every shard and they all take round-robin together.
+# The listing runs repository code, so it runs sandboxed; it is planning
+# input, not evidence, so it never reaches the uploaded logs.
+shard_split() {
+    local filter
+
+    shard_args=("--shard=$shard/$shards" --shard-test-distribution=round-robin)
+    shard_mode=round-robin
+
+    if [ "$(jq 'length' "$state/class-timings.json" 2>/dev/null || echo 0)" -eq 0 ]; then
+        say 'shards: round-robin'
+        return 0
+    fi
+
+    if ! stack_sandboxed list-tests -- php vendor/bin/phpunit --list-tests; then
+        shard_args=()
+        shard_mode=whole
+        say 'shards: the listing failed, this shard runs the whole suite'
+    elif filter="$(plan_shard "$state/list-tests.log" "$state/class-timings.json" "$shard" "$shards")"; then
+        shard_args=(--filter "$filter")
+        shard_mode=planned
+        say 'shards: by duration'
+    else
+        say 'shards: round-robin'
+    fi
+
+    rm -f "$state/list-tests.log"
+}
+
 run_test() {
     local flags=()
     local args=(
@@ -1195,14 +1395,8 @@ run_test() {
             ;;
         full)
             args=(artisan test --parallel --processes=4 --compact)
-            if [ "$shards" -gt 1 ]; then
-                # Round-robin deals the classes out one by one, so a directory of
-                # slow feature tests spreads over every shard instead of filling one.
-                args+=("--shard=$shard/$shards" --shard-test-distribution=round-robin)
-            fi
             ;;
     esac
-    args+=(--log-junit "$out/junit.xml")
 
     if jq -e '(.services // []) | index("postgres")' "$state/stack.json" >/dev/null; then
         flags=(--postgres)
@@ -1213,6 +1407,13 @@ run_test() {
         return 0
     fi
 
+    shard_mode=''
+    if [ "$php" = full ] && [ "$shards" -gt 1 ]; then
+        shard_split
+        args+=("${shard_args[@]}")
+    fi
+    args+=(--log-junit "$out/junit.xml")
+
     say 'test'
     if stack_sandboxed "${flags[@]}" test -- php "${args[@]}"; then
         status=passed
@@ -1221,6 +1422,14 @@ run_test() {
     fi
 
     collect_report
+
+    # PHPUnit passes an empty selection, so a planned shard that ran nothing would read green with its
+    # classes untested.
+    if [ "$shard_mode" = planned ] && [ "$status" = passed ] \
+        && [ "$(jq '.counts.tests // 0' "$state/summary.json")" -eq 0 ]; then
+        say 'the planned shard ran no test'
+        status=errored
+    fi
 }
 
 run_flutter_lint() {

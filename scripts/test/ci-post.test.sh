@@ -139,6 +139,41 @@ status=0
 [ "$(wc -l <"$work/state/authorization.log" | tr -d ' ')" -eq 5 ] || fail 'a 422 was retried'
 pass 'did not retry a 422'
 
+# 2b. A restarting app server: 502s past the old three-retry limit are waited
+# out, a 409 after a lost answer counts as delivered, and a 500 stays bounded.
+export CI_POST_BACKOFF_SECONDS=0
+"$ci_post" "http://127.0.0.1:$port/gateway" "$config" "$work/gateway.json" "$work/body.json" \
+    || fail 'ci-post gave up on a run of 502s'
+[ "$(cat "$work/state/gateway.count")" -eq 5 ] || fail 'expected four 502s and the 200'
+pass 'a run of 502s from a restarting server is retried until it answers'
+
+"$ci_post" "http://127.0.0.1:$port/landed" "$config" "$work/landed.json" "$work/body.json" \
+    || fail 'a 409 after a lost answer was not taken as delivered'
+[ "$(cat "$work/landed.json.status")" = 409 ] || fail 'a delivered 409 did not keep its status'
+pass 'a 409 after a 502 counts as delivered and keeps 409 in the status file'
+
+status=0
+"$ci_post" "http://127.0.0.1:$port/conflict" "$config" "$work/conflict.json" "$work/body.json" || status=$?
+[ "$status" -ne 0 ] || fail 'a first-attempt 409 counted as delivered'
+[ "$(cat "$work/conflict.json.status")" = 409 ] || fail 'a first-attempt 409 lost its status'
+pass 'a 409 on the first attempt is a real replay and fails'
+
+status=0
+"$ci_post" "http://127.0.0.1:$port/down" "$config" "$work/down.json" "$work/body.json" || status=$?
+[ "$status" -ne 0 ] || fail 'ci-post exited 0 on a server that never came back'
+[ "$(cat "$work/state/down.count")" -eq 11 ] || fail 'a lasting 502 was not tried exactly 11 times'
+pass 'a lasting 502 stops after ten retries'
+
+status=0
+"$ci_post" "http://127.0.0.1:$port/broken" "$config" "$work/broken.json" "$work/body.json" || status=$?
+[ "$status" -ne 0 ] || fail 'ci-post exited 0 on a 500'
+[ "$(cat "$work/state/broken.count")" -eq 4 ] || fail 'a 500 was not tried exactly four times'
+status=0
+"$ci_post" "http://127.0.0.1:$port/reject" "$config" "$work/reject2.json" "$work/body.json" || status=$?
+[ "$(cat "$work/reject2.json.status")" = 422 ] || fail 'a plain 422 changed meaning'
+unset CI_POST_BACKOFF_SECONDS
+pass 'a 500 still gives up after three retries'
+
 # 3. Gzip mode: the body goes as application/gzip, byte for byte, with the
 # run and job headers and a 120 s limit for an upload of up to 8 MiB.
 printf 'phase log line\n' | gzip -c >"$work/logs.gz"

@@ -18,9 +18,15 @@
 #                 8 MiB.
 #
 # Retries: 401 up to 3 times (a run id the server stored a moment ago may not
-# be visible yet), 429 and 503 after their Retry-After seconds within 300 s in
-# total, other 5xx and transport failures up to 3 times. Exits 0 on a 2xx and
-# 1 otherwise. Prints nothing on stdout.
+# be visible yet), 429 and 503 after their Retry-After seconds, 502, 504,
+# 520-524 and transport failures up to 10 times with a growing pause (5, 10,
+# 20, then 30 s; an app server restarting refuses connections for a while),
+# and a 500 up to 3 times; everything, attempts included, within 240 s of wall
+# clock. A 409 after a gateway or transport failure means an earlier attempt
+# landed and only its answer was lost, so it exits 0 with 409 in the status
+# file: the server's endpoints take each token, result and log once. Exits 0
+# on a 2xx and 1 otherwise. Prints nothing on stdout. CI_POST_BACKOFF_SECONDS
+# scales the pauses (tests set 0).
 set -euo pipefail
 
 usage() {
@@ -63,7 +69,6 @@ curl_args=(
     --silent
     --show-error
     --user-agent 'ci-job/1'
-    --max-time "$max_time"
     --dump-header "$headers"
     --output "$response"
     --write-out '%{http_code}'
@@ -92,11 +97,17 @@ curl_args+=(
 
 max_unauthorized=3
 max_server_errors=3
-wait_budget=300
+max_gateway_retries=10
+backoff="${CI_POST_BACKOFF_SECONDS:-5}"
+
+# Wall clock, attempts included: a server that accepts and never answers burns
+# every attempt's whole --max-time, and the job has a 20-minute limit. 240 s
+# also stays inside the GitHub OIDC token every attempt reuses.
+deadline=$((SECONDS + 240))
 
 unauthorized=0
 server_errors=0
-waited=0
+gateway_errors=0
 
 # Delta-seconds from the last Retry-After header; an HTTP date or a missing
 # header falls back to 5 seconds.
@@ -112,23 +123,37 @@ retry_after() {
     fi
 }
 
+# usage: finish <status> [delivered]   exits 0 on a 2xx or when told the
+# request was delivered; the status file always holds the real status.
 finish() {
     printf '%s\n' "$1" >"$response.status"
     rm -f "$headers"
 
-    if [[ "$1" =~ ^2[0-9][0-9]$ ]]; then
+    if [[ "$1" =~ ^2[0-9][0-9]$ ]] || [ "${2:-}" = delivered ]; then
         exit 0
     fi
 
     exit 1
 }
 
+# True when a pause of <seconds> still leaves time before the deadline.
+can_wait() {
+    [ $((SECONDS + $1)) -lt "$deadline" ]
+}
+
 while :; do
     : >"$headers"
+    remaining=$((deadline - SECONDS))
+    if [ "$remaining" -gt "$max_time" ]; then
+        remaining="$max_time"
+    fi
+    if [ "$remaining" -lt 5 ]; then
+        remaining=5
+    fi
 
     # curl prints 000 and exits non-zero when no response arrived; that case is
     # retried below like a 5xx, and curl's own message is already on stderr.
-    if ! code="$(curl -q "${curl_args[@]}")"; then
+    if ! code="$(curl -q --max-time "$remaining" "${curl_args[@]}")"; then
         code=000
     fi
 
@@ -145,18 +170,37 @@ while :; do
             ;;
         429 | 503)
             delay="$(retry_after)"
-            if [ $((waited + delay)) -gt "$wait_budget" ]; then
+            if ! can_wait "$delay"; then
                 finish "$code"
             fi
-            waited=$((waited + delay))
             sleep "$delay"
             ;;
-        000 | 5??)
+        409)
+            # Only after a gateway or transport failure: a first-attempt 409 is a real replay. The body is the
+            # refusal, not data; the status file keeps the 409.
+            if [ "$gateway_errors" -gt 0 ]; then
+                finish "$code" delivered
+            fi
+            finish "$code"
+            ;;
+        000 | 502 | 504 | 52[0-4])
+            # 520 to 524 are Cloudflare's answers for an origin that is down or slow.
+            delay=$((backoff * (1 << gateway_errors)))
+            if [ "$delay" -gt $((backoff * 6)) ]; then
+                delay=$((backoff * 6))
+            fi
+            if [ "$gateway_errors" -ge "$max_gateway_retries" ] || ! can_wait "$delay"; then
+                finish "$code"
+            fi
+            gateway_errors=$((gateway_errors + 1))
+            sleep "$delay"
+            ;;
+        5??)
             if [ "$server_errors" -ge "$max_server_errors" ]; then
                 finish "$code"
             fi
             server_errors=$((server_errors + 1))
-            sleep 5
+            sleep "$backoff"
             ;;
         *)
             finish "$code"
