@@ -678,14 +678,14 @@ exchange_token() {
             and (.services | optional(type == "array" and all(.[]; . == "postgres")))
             and (.scope_script | optional(relative_path))
             and (.test | type == "object")
-            and (.test.shards | type == "number" and . >= 1 and . <= 4 and . == floor)
+            and (.test.shards | type == "number" and . >= 1 and . <= 8 and . == floor)
             and (.test.filter_script | optional(relative_path));
         def flutter_block:
             (.dir == "." or (.dir | relative_path))
             and (.setup | commands)
             and (.lint | commands)
             and (.test | type == "object")
-            and (.test.shards | type == "number" and . >= 1 and . <= 4 and . == floor)
+            and (.test.shards | type == "number" and . >= 1 and . <= 8 and . == floor)
             and (.test.command | optional(shell_text));
         . as $r
         | [
