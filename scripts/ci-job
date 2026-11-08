@@ -319,6 +319,7 @@ if ($kind === 'flutter') {
     $suites = [];
     $tests = [];
     $errors = [];
+    $slow = [];
     $path = static fn (mixed $url): string => $relative(rawurldecode(preg_replace('#^file://#', '', (string) $url)));
 
     while (($line = fgets($handle)) !== false) {
@@ -339,6 +340,7 @@ if ($kind === 'flutter') {
                 'file' => $path($url),
                 'line' => (int) ($test['root_line'] ?? $test['line'] ?? 0),
                 'name' => str_replace($prefix, '', (string) ($test['name'] ?? '')),
+                'started' => (int) ($event['time'] ?? 0),
             ];
         } elseif ($type === 'error') {
             $errors[(int) ($event['testID'] ?? -1)][] = trim(
@@ -353,8 +355,20 @@ if ($kind === 'flutter') {
             }
 
             $summary['counts']['tests']++;
-            $test = $tests[$id] ?? ['file' => '', 'line' => 0, 'name' => ''];
+            $test = $tests[$id] ?? ['file' => '', 'line' => 0, 'name' => '', 'started' => null];
             $message = implode("\n\n", $errors[$id] ?? []);
+
+            // The reporter's times are milliseconds since the run started.
+            $seconds = $test['started'] === null ? 0.0 : max(0, (int) ($event['time'] ?? 0) - $test['started']) / 1000;
+
+            if ($seconds >= 2.0) {
+                $slow[] = [
+                    'name' => mb_substr($test['name'], 0, 500),
+                    'file' => mb_substr($test['file'], 0, 500),
+                    'line' => max(0, $test['line']),
+                    'seconds' => round($seconds, 3),
+                ];
+            }
 
             if (($event['skipped'] ?? false) === true) {
                 $summary['counts']['skipped']++;
@@ -369,6 +383,9 @@ if ($kind === 'flutter') {
     }
 
     fclose($handle);
+
+    usort($slow, static fn (array $a, array $b): int => $b['seconds'] <=> $a['seconds']);
+    $summary['slow_tests'] = array_slice($slow, 0, 50);
 }
 
 echo json_encode($summary, JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);

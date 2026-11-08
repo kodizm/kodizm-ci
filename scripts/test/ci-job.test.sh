@@ -138,6 +138,21 @@ if ! jq -e '.ci_run_id == "01234567-89ab-cdef-0123-456789abcdef" and .status == 
 fi
 pass 'payload carries the run id and the status'
 
+[ "$(jq -c '.slow_tests' "$state/summary.json")" = '[]' ] || fail 'a fast flutter run reported slow tests'
+report="$work/flutter-slow.json"
+cat >"$report" <<JSON
+{"suite":{"id":0,"platform":"vm","path":"$tree/test/slow_test.dart"},"type":"suite","time":0}
+{"test":{"id":1,"name":"renders the big list","suiteID":0,"groupIDs":[],"metadata":{"skip":false,"skipReason":null},"line":7,"column":3,"url":"file://$tree/test/slow_test.dart"},"type":"testStart","time":1000}
+{"testID":1,"result":"success","skipped":false,"hidden":false,"type":"testDone","time":3500}
+{"test":{"id":2,"name":"is quick","suiteID":0,"groupIDs":[],"metadata":{"skip":false,"skipReason":null},"line":9,"column":3,"url":"file://$tree/test/slow_test.dart"},"type":"testStart","time":3500}
+{"testID":2,"result":"success","skipped":false,"hidden":false,"type":"testDone","time":3600}
+JSON
+summarise flutter "$report" || fail 'summarise flutter exited non-zero on the slow report'
+slow="$(jq -c '.slow_tests' "$state/summary.json")"
+[ "$slow" = '[{"name":"renders the big list","file":"test/slow_test.dart","line":7,"seconds":2.5}]' ] \
+    || fail "flutter slow tests are $slow"
+pass 'flutter slow tests come from the reporter times'
+
 # The private log gets each test class's summed seconds, slowest first, so
 # the shard split can be measured against real class durations.
 report="$work/junit.xml"
