@@ -417,6 +417,30 @@ fi
 grep -qF '(features)' "$public" || fail 'a malformed features object was not named'
 pass 'git_proxy without a well-formed ticket, or a non-boolean feature, is refused'
 
+# A manifest may split a stack's tests over up to eight shards.
+for stack in laravel flutter; do
+    for shards in 8 9; do
+        token_response "$(jq -n --arg stack "$stack" --argjson shards "$shards" '{
+            stack: $stack,
+            role: (if $stack == "flutter" then "flutter-lint" else "lint" end),
+            manifest: {version: 1, stacks: {($stack): {dir: ".", setup: [], lint: ["true"], test: {shards: $shards}}}},
+        }')"
+        rm -rf "$tree"
+        if exchange_token; then
+            accepted=yes
+        else
+            accepted=no
+        fi
+        if [ "$shards" = 8 ] && [ "$accepted" != yes ]; then
+            fail "exchange_token refused a $stack manifest with 8 shards"
+        fi
+        if [ "$shards" = 9 ] && [ "$accepted" != no ]; then
+            fail "exchange_token accepted a $stack manifest with 9 shards"
+        fi
+    done
+done
+pass 'a manifest takes 1 to 8 shards per stack'
+
 for secret_value in "$source_token" "$ticket" acme/widgets; do
     if grep -qF -- "$secret_value" "$public"; then
         fail 'a secret or the repository reached the public log'
