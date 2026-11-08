@@ -258,7 +258,22 @@ fi
 if plan_shard "$list" "$work/missing.json" 1 2 >/dev/null; then
     fail 'plan_shard planned without timings'
 fi
-pass 'plan_shard refuses an empty list or missing timings, so the caller falls back to round-robin'
+if plan_shard "$list" "$work/plan-timings.json" 1 6 >/dev/null; then
+    fail 'plan_shard planned more shards than classes'
+fi
+{
+    printf 'Available tests:\n'
+    for index in $(seq 1 3000); do
+        printf ' - Tests\\Feature\\Generated\\Deeply\\Nested\\Namespace\\GeneratedNumber%04dTest::test_it\n' "$index"
+    done
+} >"$work/huge-list.txt"
+printf '{"Tests\\\\Unit\\\\AaTest": 1}' >"$work/huge-timings.json"
+for index in 1 2; do
+    if plan_shard "$work/huge-list.txt" "$work/huge-timings.json" "$index" 2 >/dev/null; then
+        fail "plan_shard handed shard $index a filter PCRE cannot compile"
+    fi
+done
+pass 'plan_shard refuses an empty list, missing timings, too few classes or a filter PCRE cannot compile'
 
 # Every sandboxed command's log ends with how long it took, and the command's
 # own exit code survives the bookkeeping.
@@ -275,9 +290,9 @@ code=0
 sandboxed demo "$work" -- true || code=$?
 PATH="$saved_sandbox_path"
 [ "$code" = 3 ] || fail "sandboxed returned $code, not the command's 3"
-grep -qx 'ran' "$state/demo.log" || fail 'the command output is missing from its log'
-grep -qE '^-- demo took [0-9]+\.[0-9] s$' "$state/demo.log" || fail 'the log carries no duration line'
-pass 'a sandboxed log ends with the duration and the exit code is kept'
+[ "$(cat "$state/demo.log")" = 'ran' ] || fail 'the command log holds more than the command output'
+grep -qE '^demo took [0-9]+\.[0-9] s$' "$state/durations.log" || fail 'the durations log has no line for demo'
+pass 'a sandboxed command gets a durations line, its own log stays untouched and the exit code is kept'
 
 # 3. The scope script in pr mode is the base commit's, never the head's: a
 #    pull request must not be able to rewrite the rules that judge it.
