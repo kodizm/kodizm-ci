@@ -189,7 +189,10 @@ revoke_token() {
         url="$api/gh-token"
     fi
 
-    if ! ci-post -X DELETE "$url" "$secret/github.curl" "$state/revoke.json"; then
+    # A 401 means the token no longer works, which is the point: a retried DELETE whose first attempt landed
+    # meets exactly that. The Worker answers a bad ticket with 404, so that case still fails.
+    if ! ci-post -X DELETE "$url" "$secret/github.curl" "$state/revoke.json" \
+        && [ "$(http_status "$state/revoke.json")" != 401 ]; then
         revoked=false
     fi
 

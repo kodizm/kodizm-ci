@@ -149,7 +149,20 @@ pass 'a run of 502s from a restarting server is retried until it answers'
 
 "$ci_post" "http://127.0.0.1:$port/landed" "$config" "$work/landed.json" "$work/body.json" \
     || fail 'a 409 after a lost answer was not taken as delivered'
-pass 'a 409 after a 502 counts as delivered'
+[ "$(cat "$work/landed.json.status")" = 409 ] || fail 'a delivered 409 did not keep its status'
+pass 'a 409 after a 502 counts as delivered and keeps 409 in the status file'
+
+status=0
+"$ci_post" "http://127.0.0.1:$port/conflict" "$config" "$work/conflict.json" "$work/body.json" || status=$?
+[ "$status" -ne 0 ] || fail 'a first-attempt 409 counted as delivered'
+[ "$(cat "$work/conflict.json.status")" = 409 ] || fail 'a first-attempt 409 lost its status'
+pass 'a 409 on the first attempt is a real replay and fails'
+
+status=0
+"$ci_post" "http://127.0.0.1:$port/down" "$config" "$work/down.json" "$work/body.json" || status=$?
+[ "$status" -ne 0 ] || fail 'ci-post exited 0 on a server that never came back'
+[ "$(cat "$work/state/down.count")" -eq 11 ] || fail 'a lasting 502 was not tried exactly 11 times'
+pass 'a lasting 502 stops after ten retries'
 
 status=0
 "$ci_post" "http://127.0.0.1:$port/broken" "$config" "$work/broken.json" "$work/body.json" || status=$?

@@ -69,6 +69,21 @@ if ($path === '/landed') {
     return true;
 }
 
+if ($path === '/conflict') {
+    http_response_code(409);
+    echo '{"error":{"code":"replayed"}}';
+
+    return true;
+}
+
+if ($path === '/down') {
+    $calls('down');
+    http_response_code(502);
+    echo '{"error":{"code":"down"}}';
+
+    return true;
+}
+
 if ($path === '/broken') {
     $calls('broken');
     http_response_code(500);
