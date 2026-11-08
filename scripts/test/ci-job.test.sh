@@ -175,6 +175,95 @@ if [ -e "$state/timings.log" ]; then
 fi
 pass 'an unreadable report leaves no timings log'
 
+# The results carry the slowest test cases (2 s and up) and the summed seconds
+# of every class, so the server can warn about slow tests and split the next
+# run's shards by duration.
+report="$work/junit-times.xml"
+cat >"$report" <<XML
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="" tests="3" time="4.5">
+    <testsuite name="Tests\\Feature\\SlowTest" file="$tree/tests/Feature/SlowTest.php" tests="2" time="3.5">
+      <testcase name="test_b" class="Tests\\Feature\\SlowTest" file="$tree/tests/Feature/SlowTest.php" line="9" time="1.5"/>
+      <testcase name="test_c" class="Tests\\Feature\\SlowTest" file="$tree/tests/Feature/SlowTest.php" line="19" time="2.25"/>
+    </testsuite>
+    <testsuite name="Tests\\Unit\\MidTest" file="$tree/tests/Unit/MidTest.php" tests="1" time="1">
+      <testcase name="test_d" class="Tests\\Unit\\MidTest" file="$tree/tests/Unit/MidTest.php" line="9" time="1"/>
+    </testsuite>
+  </testsuite>
+</testsuites>
+XML
+
+if ! summarise junit "$report"; then
+    fail 'summarise junit exited non-zero'
+fi
+slow="$(jq -c '.slow_tests' "$state/summary.json")"
+expected='[{"name":"Tests\\Feature\\SlowTest::test_c","file":"tests/Feature/SlowTest.php","line":19,"seconds":2.25}]'
+[ "$slow" = "$expected" ] || fail "slow tests are $slow"
+jq -e '.class_timings == {"Tests\\Feature\\SlowTest": 3.75, "Tests\\Unit\\MidTest": 1}' "$state/summary.json" \
+    >/dev/null || fail "class timings are $(jq -c '.class_timings' "$state/summary.json")"
+pass 'the junit summary carries the slow test cases and the class timings'
+
+status=passed
+last_log=''
+build_payload
+jq -e '.slow_tests[0].seconds == 2.25 and .class_timings["Tests\\Unit\\MidTest"] == 1' "$state/results.json" \
+    >/dev/null || fail 'the results payload lost the slow tests or the class timings'
+pass 'the results payload carries the slow tests and the class timings'
+
+# A shard plan deals the classes PHPUnit lists to the shards by measured
+# duration, slowest first onto the least loaded shard; a class without a
+# timing counts as the median. Every shard computes the same plan.
+list="$work/list-tests.txt"
+cat >"$list" <<'TXT'
+PHPUnit 13.4.5 by Sebastian Bergmann and contributors.
+
+Available tests:
+ - Tests\Unit\AaTest::test_one
+ - Tests\Unit\AaTest::test_two with data set #0
+ - Tests\Unit\BbTest::test_x
+ - Tests\Feature\CcTest::test_y
+ - Tests\Feature\DdTest::test_z
+ - Tests\Feature\NewTest::test_new
+TXT
+printf '%s\n' '{"Tests\\Unit\\AaTest": 10, "Tests\\Unit\\BbTest": 6, "Tests\\Feature\\CcTest": 5,' \
+    '"Tests\\Feature\\DdTest": 1, "Tests\\Feature\\GoneTest": 99}' >"$work/plan-timings.json"
+
+first="$(plan_shard "$list" "$work/plan-timings.json" 1 2)" || fail 'plan_shard refused shard 1'
+second="$(plan_shard "$list" "$work/plan-timings.json" 2 2)" || fail 'plan_shard refused shard 2'
+[ "$first" = '{^(?:Tests\\Unit\\AaTest|Tests\\Feature\\CcTest)::}' ] || fail "shard 1 filter is $first"
+[ "$second" = '{^(?:Tests\\Unit\\BbTest|Tests\\Feature\\NewTest|Tests\\Feature\\DdTest)::}' ] \
+    || fail "shard 2 filter is $second"
+pass 'plan_shard splits by duration, counts an unknown class as the median and skips a gone class'
+
+printf 'Available tests:\n' >"$work/empty-list.txt"
+if plan_shard "$work/empty-list.txt" "$work/plan-timings.json" 1 2 >/dev/null; then
+    fail 'plan_shard planned an empty list'
+fi
+if plan_shard "$list" "$work/missing.json" 1 2 >/dev/null; then
+    fail 'plan_shard planned without timings'
+fi
+pass 'plan_shard refuses an empty list or missing timings, so the caller falls back to round-robin'
+
+# Every sandboxed command's log ends with how long it took, and the command's
+# own exit code survives the bookkeeping.
+mkdir -p "$work/sandbox-shim"
+cat >"$work/sandbox-shim/ci-sandbox" <<'SH'
+#!/usr/bin/env bash
+printf 'ran\n' >>"$1"
+exit 3
+SH
+chmod +x "$work/sandbox-shim/ci-sandbox"
+saved_sandbox_path="$PATH"
+PATH="$work/sandbox-shim:$PATH"
+code=0
+sandboxed demo "$work" -- true || code=$?
+PATH="$saved_sandbox_path"
+[ "$code" = 3 ] || fail "sandboxed returned $code, not the command's 3"
+grep -qx 'ran' "$state/demo.log" || fail 'the command output is missing from its log'
+grep -qE '^-- demo took [0-9]+\.[0-9] s$' "$state/demo.log" || fail 'the log carries no duration line'
+pass 'a sandboxed log ends with the duration and the exit code is kept'
+
 # 3. The scope script in pr mode is the base commit's, never the head's: a
 #    pull request must not be able to rewrite the rules that judge it.
 tree="$work/repo"
@@ -440,6 +529,19 @@ for stack in laravel flutter; do
     done
 done
 pass 'a manifest takes 1 to 8 shards per stack'
+
+# The token response's class timings are kept for the shard plan, minus any
+# entry that is not a class name with a non-negative number.
+token_response '{"class_timings": {"Tests\\Unit\\AaTest": 2.5, "../escape": 1, "Tests\\Unit\\BbTest": -1}}'
+rm -rf "$tree"
+exchange_token || fail 'exchange_token refused a response with class timings'
+jq -e '. == {"Tests\\Unit\\AaTest": 2.5}' "$state/class-timings.json" >/dev/null \
+    || fail "kept class timings are $(cat "$state/class-timings.json")"
+token_response '{}'
+rm -rf "$tree"
+exchange_token || fail 'exchange_token refused a response without class timings'
+jq -e '. == {}' "$state/class-timings.json" >/dev/null || fail 'a response without timings left some behind'
+pass 'class timings from the token response are filtered and kept for the shard plan'
 
 for secret_value in "$source_token" "$ticket" acme/widgets; do
     if grep -qF -- "$secret_value" "$public"; then
