@@ -346,6 +346,28 @@ if [ -e "$scope_file" ]; then
 fi
 pass 'pr mode stages nothing when the base has no scope script'
 
+# The scope diffs against the merge base the server sent, fetched unless the
+# tree already has it; one that cannot be fetched falls back to the base tip,
+# which only widens the scope. A subshell keeps the fetch stub out of the
+# source delivery tests below.
+merge_base_check="$(
+    fetch_commit() {
+        echo "fetched $1" >&2
+        return 1
+    }
+    merge_base_sha="$head_sha"
+    fetch_merge_base 2>>"$work/merge-base.fetches"
+    echo "present=$(scope_base)"
+    merge_base_sha="$(printf 'f%.0s' {1..40})"
+    fetch_merge_base 2>>"$work/merge-base.fetches"
+    echo "missing=$(scope_base)"
+)"
+[ "$merge_base_check" = "present=$head_sha
+missing=$base_sha" ] || fail "the scope base was wrong: $merge_base_check"
+[ "$(cat "$work/merge-base.fetches")" = "fetched $(printf 'f%.0s' {1..40})" ] \
+    || fail 'a merge base in the tree was fetched again, or a missing one was not fetched'
+pass 'the scope diffs against the merge base, or the base tip when it cannot be fetched'
+
 # 4. The API host and both audiences have no default: every pool names its
 #    own, so a missing one stops the job before anything touches the network.
 expect_unset_refused() {
