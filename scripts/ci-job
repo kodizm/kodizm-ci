@@ -544,6 +544,188 @@ echo $filters[$shard - 1];
 PHP
 }
 
+# True when the stack holds its test shards to a coverage floor; the shard
+# then collects line coverage while it tests and reports it with the results.
+coverage_wanted() {
+    jq -e '.test.coverage != null' "$state/stack.json" >/dev/null
+}
+
+# Turns a Clover XML (PHPUnit) or LCOV (flutter test) coverage file into the
+# base64 of a gzipped {path: [executable ranges, covered ranges]}, paths
+# relative to the stack's directory, ranges like "1-5,8". The file came out of
+# the sandbox, so it is read as data only; a damaged file, or a map past the
+# server's limits, exits 1.
+coverage_lines() {
+    php -d memory_limit=1G -d display_errors=stderr -- "$1" "$2" "$3" <<'PHP'
+<?php
+
+[, $kind, $file, $prefix] = $argv;
+
+$lines = [];
+libxml_use_internal_errors(true);
+
+$relative = static fn (string $path): string => str_starts_with($path, $prefix)
+    ? substr($path, strlen($prefix))
+    : $path;
+
+if ($kind === 'clover') {
+    $reader = new XMLReader();
+
+    if (! $reader->open($file, null, LIBXML_NONET | LIBXML_NOERROR | LIBXML_NOWARNING)) {
+        exit(1);
+    }
+
+    $current = null;
+
+    while ($reader->read()) {
+        if ($reader->nodeType !== XMLReader::ELEMENT) {
+            continue;
+        }
+
+        if ($reader->name === 'file') {
+            $current = $relative((string) $reader->getAttribute('name'));
+            $lines[$current] ??= [[], []];
+        } elseif ($reader->name === 'line' && $current !== null && $reader->getAttribute('type') === 'stmt') {
+            $number = (int) $reader->getAttribute('num');
+            $lines[$current][0][$number] = true;
+
+            if ((int) $reader->getAttribute('count') > 0) {
+                $lines[$current][1][$number] = true;
+            }
+        }
+    }
+
+    // A truncated or damaged file reads as a shorter one; it must count as no coverage, not as less.
+    if (libxml_get_errors() !== []) {
+        exit(1);
+    }
+} else {
+    $handle = fopen($file, 'r');
+    $current = null;
+
+    while (($line = fgets($handle)) !== false) {
+        $line = rtrim($line, "\r\n");
+
+        if (str_starts_with($line, 'SF:')) {
+            $current = $relative(substr($line, 3));
+            $lines[$current] ??= [[], []];
+        } elseif (str_starts_with($line, 'DA:') && $current !== null) {
+            [$number, $count] = array_map('intval', explode(',', substr($line, 3), 3) + [1 => 0]);
+            $lines[$current][0][$number] = true;
+
+            if ($count > 0) {
+                $lines[$current][1][$number] = true;
+            }
+        } elseif ($line === 'end_of_record') {
+            $current = null;
+        }
+    }
+
+    fclose($handle);
+}
+
+$ranges = static function (array $set): string {
+    $numbers = array_keys($set);
+    sort($numbers);
+    $parts = [];
+    $start = null;
+    $previous = null;
+
+    foreach ($numbers as $number) {
+        if ($number < 1) {
+            continue;
+        }
+
+        if ($start !== null && $number === $previous + 1) {
+            $previous = $number;
+
+            continue;
+        }
+
+        if ($start !== null) {
+            $parts[] = $start === $previous ? (string) $start : $start.'-'.$previous;
+        }
+
+        $start = $previous = $number;
+    }
+
+    if ($start !== null) {
+        $parts[] = $start === $previous ? (string) $start : $start.'-'.$previous;
+    }
+
+    return implode(',', $parts);
+};
+
+$coverage = [];
+
+foreach ($lines as $path => [$executable, $covered]) {
+    if ($executable === []) {
+        continue;
+    }
+
+    // The server's limits, checked here: a map it would refuse is no coverage at once, never a 422 that leaves
+    // the run waiting for results. Dropping the path instead would raise the figure.
+    if (preg_match('/^[^\x00-\x1f\x7f]{1,500}$/uD', $path) !== 1
+        || str_starts_with($path, '/')
+        || in_array('..', explode('/', $path), true)
+        || max(array_keys($executable)) > 999999) {
+        exit(1);
+    }
+
+    $coverage[$path] = [$ranges($executable), $ranges(array_intersect_key($covered, $executable))];
+
+    if (strlen($coverage[$path][0]) > 20000 || strlen($coverage[$path][1]) > 20000) {
+        exit(1);
+    }
+}
+
+if (count($coverage) > 10000) {
+    exit(1);
+}
+
+ksort($coverage);
+echo base64_encode(gzencode(
+    json_encode((object) $coverage, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
+    9,
+));
+PHP
+}
+
+# Copies the shard's coverage file out of $out as uid 2000 and writes the
+# root-only coverage.gz.b64 build_payload sends. A missing, oversized or
+# unreadable file writes nothing, and the server then counts the shard's
+# coverage as missing.
+collect_coverage() {
+    local kind="$1"
+    local name="$2"
+    local copy="$state/coverage.$kind"
+    local prefix="$tree/"
+    local cap=268435456
+
+    rm -f "$state/coverage.gz.b64" "$copy"
+    if [ "$dir" != . ]; then
+        prefix="$tree/$dir/"
+    fi
+
+    if ! { [ -e "$out/$name" ] || [ -L "$out/$name" ]; } \
+        || ! ci-sandbox "$copy" "$out" -- head -c "$cap" "$name"; then
+        say 'the shard wrote no coverage'
+        return 0
+    fi
+
+    if [ "$(wc -c <"$copy")" -ge "$cap" ]; then
+        say 'the coverage file is too large to read'
+        return 0
+    fi
+
+    if ! coverage_lines "$kind" "$copy" "$prefix" >"$state/coverage.tmp" \
+        || ! [[ "$(cat "$state/coverage.tmp")" =~ ^[A-Za-z0-9+/]+=*$ ]]; then
+        say 'the coverage file could not be read or breaks the limits'
+        rm -f "$state/coverage.tmp"
+        return 0
+    fi
+    mv "$state/coverage.tmp" "$state/coverage.gz.b64"
+}
 # Summarises the first report a command left in CI_REPORT_DIR. The existence
 # test only stats the name; collect does the reading.
 collect_report() {
@@ -617,15 +799,24 @@ build_payload() {
     local max_failures
     local max_message
     local max_annotations
+    local with_coverage
     local tail_file="$state/tail.txt"
+    local coverage_file="$state/coverage.gz.b64"
 
     : >"$tail_file"
+    if [ ! -f "$coverage_file" ]; then
+        coverage_file="$state/no-coverage"
+        : >"$coverage_file"
+    fi
     if [ -n "$last_log" ] && [ -f "$state/$last_log.log" ]; then
         failure_tail "$state/$last_log.log" >"$tail_file"
     fi
 
-    for tier in '200 2000 500' '50 500 100' '0 0 0'; do
-        read -r max_failures max_message max_annotations <<<"$tier"
+    # Coverage is part of the verdict, so it outlasts the failures: every tier
+    # carries it but the last, and the server errors a run whose coverage is
+    # missing rather than passing it.
+    for tier in '200 2000 500 1' '50 500 100 1' '0 0 0 1' '0 0 0 0'; do
+        read -r max_failures max_message max_annotations with_coverage <<<"$tier"
 
         jq -n \
             --arg id "$CI_RUN_ID" \
@@ -634,6 +825,8 @@ build_payload() {
             --arg phase "$last_log" \
             --rawfile tail "$tail_file" \
             --slurpfile summary "$state/summary.json" \
+            --rawfile coverage "$coverage_file" \
+            --argjson with_coverage "$with_coverage" \
             --argjson max_failures "$max_failures" \
             --argjson max_message "$max_message" \
             --argjson max_annotations "$max_annotations" '
@@ -657,9 +850,14 @@ build_payload() {
                 then {slow_tests: $s.slow_tests} else {} end)
             + (if $max_failures > 0 and ($s.class_timings // {} | length) > 0
                 then {class_timings: $s.class_timings} else {} end)
+            + (if $with_coverage == 1 and ($coverage | length) > 0
+                then {coverage_gz: $coverage} else {} end)
         ' >"$state/results.json"
 
         if [ "$(wc -c <"$state/results.json")" -le 524288 ]; then
+            if [ "$with_coverage" = 0 ] && [ -s "$coverage_file" ]; then
+                say 'the coverage did not fit in 512 KB and was left out'
+            fi
             return 0
         fi
     done
@@ -1443,6 +1641,14 @@ run_test() {
     fi
     args+=(--log-junit "$out/junit.xml")
 
+    # A narrowed run (docs, affected) covers a sliver of the code, so only a
+    # full run measures coverage.
+    local coverage=false
+    if [ "$php" = full ] && coverage_wanted; then
+        coverage=true
+        args+=(--coverage-clover "$out/coverage.xml")
+    fi
+
     say 'test'
     if stack_sandboxed "${flags[@]}" test -- php "${args[@]}"; then
         status=passed
@@ -1451,6 +1657,9 @@ run_test() {
     fi
 
     collect_report
+    if [ "$coverage" = true ]; then
+        collect_coverage clover coverage.xml
+    fi
 
     # PHPUnit passes an empty selection, so a planned shard that ran nothing would read green with its
     # classes untested.
@@ -1499,17 +1708,20 @@ run_flutter_warm() {
 flutter_test_command() {
     local command
     local reporter='--file-reporter "json:$CI_REPORT_DIR/flutter.json"'
+    local coverage='--coverage --coverage-path "$CI_REPORT_DIR/lcov.info"'
 
     command="$(jq -r '.test.command // empty' "$state/stack.json")"
     if [ -z "$command" ]; then
-        cat <<'SH'
-flutter test --total-shards "$CI_SHARDS" --shard-index "$((CI_SHARD - 1))" --file-reporter "json:$CI_REPORT_DIR/flutter.json"
-SH
-        return 0
+        command='flutter test --total-shards "$CI_SHARDS" --shard-index "$((CI_SHARD - 1))" --file-reporter "json:$CI_REPORT_DIR/flutter.json"'
     fi
 
     if [[ "$command" == *'flutter test'* ]] && [[ "$command" != *--file-reporter* ]]; then
         command="${command/flutter test/flutter test $reporter}"
+    fi
+    # With a coverage floor the shard collects coverage where collect_coverage
+    # reads it, whatever the command says.
+    if coverage_wanted && [[ "$command" == *'flutter test'* ]]; then
+        command="${command/flutter test/flutter test $coverage}"
     fi
     printf '%s\n' "$command"
 }
@@ -1533,6 +1745,9 @@ run_flutter_test() {
     fi
 
     collect_report
+    if coverage_wanted; then
+        collect_coverage lcov lcov.info
+    fi
 }
 
 run() {
