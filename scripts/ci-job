@@ -64,6 +64,8 @@ results_audience="${CI_RESULTS_AUDIENCE:-}"
 
 phase=''
 status=errored
+base_sha=''
+merge_base_sha=''
 last_log=''
 reporting=false
 sandbox_env=()
@@ -845,6 +847,8 @@ exchange_token() {
             (if (.repository | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) then empty else "repository" end),
             (if (.head_sha | type == "string" and test("^[0-9a-f]{40}$")) then empty else "head_sha" end),
             (if (.base_sha == null or (.base_sha | type == "string" and test("^([0-9a-f]{40})?$"))) then empty else "base_sha" end),
+            (if (.merge_base_sha == null or (.merge_base_sha | type == "string" and test("^[0-9a-f]{40}$")))
+                then empty else "merge_base_sha" end),
             (if (.mode | IN("pr", "main")) then empty else "mode" end),
             (if (.role | IN("lint", "aux", "warm", "test", "flutter-lint", "flutter-warm", "flutter-test")) then empty else "role" end),
             (if (.shards | type == "number" and . >= 1 and . == floor) then empty else "shards" end),
@@ -917,6 +921,7 @@ exchange_token() {
     shards="$(jq -r '.shards' "$secret/token.json")"
     head_sha="$(jq -r '.head_sha' "$secret/token.json")"
     base_sha="$(jq -r '.base_sha // ""' "$secret/token.json")"
+    merge_base_sha="$(jq -r '.merge_base_sha // ""' "$secret/token.json")"
     cache_namespace="$(jq -r '.cache_namespace' "$secret/token.json")"
     dir="$(jq -r '.dir' "$state/stack.json")"
     repository="$(jq -r '.repository' "$secret/token.json")"
@@ -1013,6 +1018,30 @@ SH
             base_sha=''
         fi
     fi
+
+    fetch_merge_base
+}
+
+# The scope diffs against the merge base when the server sent one; it is
+# often the base tip itself, already here. One that cannot be fetched is
+# dropped and the base tip stands in, which only widens the scope.
+fetch_merge_base() {
+    if [[ "$merge_base_sha" =~ ^[0-9a-f]{40}$ ]] \
+        && ! git -C "$tree" cat-file -e "$merge_base_sha^{commit}" 2>/dev/null \
+        && ! fetch_commit "$merge_base_sha"; then
+        merge_base_sha=''
+    fi
+}
+
+# The commit the scope script diffs the head against: the pull request's merge
+# base when there is one, so changes the base gained after the branch forked
+# are not counted as the pull request's own; otherwise the base tip.
+scope_base() {
+    if [[ "$merge_base_sha" =~ ^[0-9a-f]{40}$ ]]; then
+        printf '%s' "$merge_base_sha"
+    else
+        printf '%s' "$base_sha"
+    fi
 }
 
 scope_value() {
@@ -1076,7 +1105,7 @@ decide_scope() {
         return 0
     fi
 
-    if ! sandboxed scope "$tree" -- "${scope_command[@]}" "$base_sha" "$head_sha" "$mode"; then
+    if ! sandboxed scope "$tree" -- "${scope_command[@]}" "$(scope_base)" "$head_sha" "$mode"; then
         say 'the scope script failed'
         return 1
     fi
