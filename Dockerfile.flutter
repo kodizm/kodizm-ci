@@ -4,7 +4,8 @@
 # root to mount its workspace, and the scripts under /opt/ci drop to the unprivileged `ci`
 # account (uid 2000) with setpriv before they touch anything that came from a pull request.
 # php-cli is here only for the root-side summariser inside ci-job; the Flutter suites never
-# run PHP.
+# run PHP. php-mbstring because the summariser clips test names and messages with mb_substr:
+# without it the summary of any shard with a slow or failing test died and reported 0 tests.
 #
 # trixie, not bookworm: icon checks (uptizm bin/sync-icons --check) compare librsvg renders with
 # committed PNGs, and bookworm's librsvg 2.54 draws feDropShadow differently enough to move up to
@@ -21,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         jq \
         librsvg2-bin \
         php-cli \
+        php-mbstring \
         procps \
         python3 \
         python3-pil \
