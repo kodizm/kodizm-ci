@@ -67,7 +67,9 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
-          push: ${{ env.PUBLISH == 'true' }}
+          # zstd layers unpack several times faster than gzip, and unpacking, not the download, is most of the
+          # time a job spends starting its container (the 1.7 GB flutter image: about a minute).
+          outputs: type=image,push=${{ env.PUBLISH == 'true' }},compression=zstd,compression-level=3,force-compression=true,oci-mediatypes=true
           provenance: false
           tags: ${{ env.REPOSITORY }}:cand-${{ github.sha }}
           cache-from: type=registry,ref=${{ env.REPOSITORY }}:buildcache
