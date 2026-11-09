@@ -832,6 +832,64 @@ default+='--file-reporter "json:$CI_REPORT_DIR/flutter.json"'
 [ "$(flutter_command '')" = "$default" ] || fail 'the default flutter test command changed'
 pass 'a flutter test override gets the JSON file reporter when it lacks one'
 
+# 8b. With a coverage floor every flutter test command collects coverage where
+#     collect_coverage reads it; without one nothing changes.
+jq -n --arg command 'bin/test-bundle && flutter test --total-shards 2 test' \
+    '{test: {command: $command, coverage: {min: 90, exclude: []}}}' >"$state/stack.json"
+expected='bin/test-bundle && flutter test --coverage --coverage-path "$CI_REPORT_DIR/lcov.info" '
+expected+="$reporter --total-shards 2 test"
+[ "$(flutter_test_command)" = "$expected" ] \
+    || fail "a coverage floor gave the command $(flutter_test_command)"
+pass 'a coverage floor adds --coverage to the flutter test command'
+
+# 8c. Coverage files become a gzipped {path: [executable, covered]} map of
+#     ranges relative to the stack directory: Clover counts only statement
+#     lines, LCOV its DA lines. A damaged file, or a path the server would
+#     refuse, is no coverage at all rather than less of it.
+unpack_coverage() {
+    base64 -d | gunzip
+}
+cat >"$work/coverage.xml" <<XML
+<?xml version="1.0" encoding="UTF-8"?>
+<coverage generated="1"><project timestamp="1">
+<file name="$tree/backend/app/Models/Watch.php">
+<line num="3" type="method" name="x" count="1"/>
+<line num="4" type="stmt" count="1"/><line num="5" type="stmt" count="1"/>
+<line num="6" type="stmt" count="0"/><line num="9" type="stmt" count="2"/>
+</file>
+<file name="$tree/backend/app/Empty.php"></file>
+</project></coverage>
+XML
+clover="$(coverage_lines clover "$work/coverage.xml" "$tree/backend/")"
+[ "$(printf '%s' "$clover" | unpack_coverage)" = '{"app/Models/Watch.php":["4-6,9","4-5,9"]}' ] \
+    || fail "clover became $(printf '%s' "$clover" | unpack_coverage)"
+printf 'SF:lib/a b.dart\nDA:1,1\nDA:2,0\nDA:3,4\nend_of_record\nSF:%s/lib/b.dart\nDA:7,0\nend_of_record\n' "$tree" \
+    >"$work/lcov.info"
+lcov="$(coverage_lines lcov "$work/lcov.info" "$tree/" | unpack_coverage)"
+[ "$lcov" = '{"lib/a b.dart":["1-3","1,3"],"lib/b.dart":["7",""]}' ] || fail "lcov became $lcov"
+head -c 300 "$work/coverage.xml" >"$work/truncated.xml"
+coverage_lines clover "$work/truncated.xml" "$tree/backend/" >/dev/null 2>&1 \
+    && fail 'a truncated clover file read as coverage'
+printf 'SF:/elsewhere/x.dart\nDA:1,1\nend_of_record\n' >"$work/outside.info"
+coverage_lines lcov "$work/outside.info" "$tree/" >/dev/null 2>&1 && fail 'a path outside the tree was sent'
+printf 'SF:lib/a.dart\nDA:1000000,1\nend_of_record\n' >"$work/far.info"
+coverage_lines lcov "$work/far.info" "$tree/" >/dev/null 2>&1 && fail 'a line past the server limit was sent'
+pass 'coverage becomes stack-relative ranges, and a damaged or refused file becomes none'
+
+# 8d. Coverage rides in every payload tier but the last, so oversized
+#     failures never push it out; the last tier drops it rather than the
+#     whole result.
+printf '%s' "$clover" >"$state/coverage.gz.b64"
+write_empty_summary
+status=passed
+last_log='test'
+build_payload
+[ "$(jq -r '.coverage_gz' "$state/results.json")" = "$clover" ] || fail 'the payload lost the coverage'
+rm -f "$state/coverage.gz.b64"
+build_payload
+[ "$(jq -c 'has("coverage_gz")' "$state/results.json")" = false ] || fail 'a shard without coverage sent some'
+pass 'the payload carries the shard coverage when there is one'
+
 # 9. sync-neutral-images: a dry run copies and checks the image sources and
 #    commits once as the neutral identity without touching the network; a
 #    source carrying an owner string is refused before any commit.
