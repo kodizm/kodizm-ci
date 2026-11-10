@@ -55,8 +55,10 @@ cache="$root/cache"
 changed_files="$root/changed-files"
 scope_file="$root/scope-script"
 sandbox_uid=2000
-# Pause before a fetch's second try; the third waits twice as long.
-CI_FETCH_BACKOFF_SECONDS="${CI_FETCH_BACKOFF_SECONDS:-5}"
+# Pause before a fetch's second try; each later one doubles, up to 60 s, plus
+# up to CI_FETCH_JITTER_SECONDS so shards refused together retry apart.
+CI_FETCH_BACKOFF_SECONDS="${CI_FETCH_BACKOFF_SECONDS:-10}"
+CI_FETCH_JITTER_SECONDS="${CI_FETCH_JITTER_SECONDS:-5}"
 api="${CI_API:-}"
 api="${api%/}"
 token_audience="${CI_TOKEN_AUDIENCE:-}"
@@ -67,6 +69,9 @@ status=errored
 base_sha=''
 merge_base_sha=''
 last_log=''
+# `transient` when the job broke on the edge (a fetch or token exchange kept
+# refused) before any repository code ran, so the server may run it again.
+failure_reason=''
 reporting=false
 sandbox_env=()
 git_proxy=false
@@ -823,6 +828,7 @@ build_payload() {
             --arg status "$status" \
             --argjson duration "$SECONDS" \
             --arg phase "$last_log" \
+            --arg reason "$failure_reason" \
             --rawfile tail "$tail_file" \
             --slurpfile summary "$state/summary.json" \
             --rawfile coverage "$coverage_file" \
@@ -852,6 +858,7 @@ build_payload() {
                 then {class_timings: $s.class_timings} else {} end)
             + (if $with_coverage == 1 and ($coverage | length) > 0
                 then {coverage_gz: $coverage} else {} end)
+            + (if $reason == "" then {} else {reason: $reason} end)
         ' >"$state/results.json"
 
         if [ "$(wc -c <"$state/results.json")" -le 524288 ]; then
@@ -1002,6 +1009,12 @@ exchange_token() {
     if ! ci-post "$api/api/ci/token" "$secret/oidc-token.curl" "$secret/token.json" "$state/token-request.json"; then
         rm -f "$secret/oidc-token.curl"
         say "token exchange failed (HTTP $(http_status "$secret/token.json"))"
+        # A rate limit, a server error or no answer is the edge or a deploy
+        # in flight; a 4xx is the server refusing this job, which a retry
+        # would not change.
+        case "$(http_status "$secret/token.json")" in
+            000 | 429 | 5??) failure_reason=transient ;;
+        esac
         return 1
     fi
     rm -f "$secret/oidc-token.curl"
@@ -1173,18 +1186,21 @@ git_with_token() {
     fi
 }
 
-# One commit at depth 1. GitHub and the Worker's edge refuse a burst now and
-# then with a 429 or a 5xx; three tries with a growing pause outlast it, and a
-# refusal that lasts still fails the job.
+# One commit at depth 1. GitHub refuses a burst of shard fetches now and then
+# with a 429 that can outlast 15 s, and the edge a 5xx; five tries over about
+# two minutes (10, 20, 40, 60 s plus jitter) outlast it, and a refusal that
+# lasts still fails the job.
 fetch_commit() {
     local try
+    local pause="$CI_FETCH_BACKOFF_SECONDS"
 
-    for try in 1 2 3; do
+    for try in 1 2 3 4 5; do
         if git_with_token fetch --quiet --no-tags --depth=1 origin "$1"; then
             return 0
         fi
-        if [ "$try" -lt 3 ]; then
-            sleep "$((CI_FETCH_BACKOFF_SECONDS * try))"
+        if [ "$try" -lt 5 ]; then
+            sleep "$((pause + RANDOM % (CI_FETCH_JITTER_SECONDS + 1)))"
+            pause=$((pause * 2 > 60 ? 60 : pause * 2))
         fi
     done
 
@@ -1203,8 +1219,12 @@ SH
         chmod 0700 "$secret/askpass"
     fi
 
+    # Every lost head fetch counts as transient, a gone commit or a refused
+    # token too: git prints only the status, and a wrong guess costs at most
+    # the server's two retries.
     if ! fetch_commit "$head_sha"; then
         say 'fetching the head commit failed'
+        failure_reason=transient
         return 1
     fi
     git -C "$tree" -c advice.detachedHead=false checkout --quiet --detach FETCH_HEAD

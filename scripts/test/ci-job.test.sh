@@ -922,10 +922,11 @@ fi
 pass 'sync-neutral-images refuses a source carrying an owner string'
 
 # 10. A fetch that meets a transient refusal (a 429 or a 5xx from GitHub or the
-# Worker) is tried again after a growing pause, three tries in all; a refusal
-# that lasts fails the job.
+# Worker) is tried again after a doubling pause plus jitter, five tries in all;
+# a refusal that lasts fails the job.
 fetch_attempts="$work/fetch-attempts"
-fetch_failures=2
+fetch_failures=4
+CI_FETCH_JITTER_SECONDS=0
 git_with_token() {
     echo "$*" >>"$fetch_attempts"
     [ "$(wc -l <"$fetch_attempts")" -gt "$fetch_failures" ]
@@ -933,20 +934,82 @@ git_with_token() {
 sleep() {
     echo "$1" >>"$work/slept"
 }
-fetch_commit "$(printf 'a%.0s' {1..40})" || fail 'a fetch that fails twice then succeeds was given up'
-[ "$(wc -l <"$fetch_attempts")" -eq 3 ] || fail "the fetch ran $(wc -l <"$fetch_attempts") times, not 3"
-[ "$(paste -sd, "$work/slept")" = "$((CI_FETCH_BACKOFF_SECONDS)),$((CI_FETCH_BACKOFF_SECONDS * 2))" ] \
-    || fail "the pauses were $(paste -sd, "$work/slept")"
+fetch_commit "$(printf 'a%.0s' {1..40})" || fail 'a fetch that fails four times then succeeds was given up'
+[ "$(wc -l <"$fetch_attempts")" -eq 5 ] || fail "the fetch ran $(wc -l <"$fetch_attempts") times, not 5"
+[ "$(paste -sd, "$work/slept")" = '10,20,40,60' ] || fail "the pauses were $(paste -sd, "$work/slept")"
 grep -q -- '--depth=1 origin a\{40\}$' "$fetch_attempts" || fail 'the retried fetch lost its arguments'
-pass 'a transient fetch failure is retried with a growing pause'
+pass 'a transient fetch failure is retried with a doubling pause, capped at 60 s'
 
 rm -f "$fetch_attempts" "$work/slept"
+CI_FETCH_JITTER_SECONDS=5
+fetch_failures=1
+fetch_commit "$(printf 'c%.0s' {1..40})" || fail 'a fetch that fails once then succeeds was given up'
+pause="$(cat "$work/slept")"
+[ "$pause" -ge 10 ] && [ "$pause" -le 15 ] || fail "a jittered pause of $pause s left 10 to 15 s"
+pass 'a pause carries up to CI_FETCH_JITTER_SECONDS of jitter, so shards that failed together retry apart'
+
+rm -f "$fetch_attempts" "$work/slept"
+CI_FETCH_JITTER_SECONDS=0
 fetch_failures=9
 if fetch_commit "$(printf 'b%.0s' {1..40})"; then
     fail 'a fetch that keeps failing succeeded'
 fi
-[ "$(wc -l <"$fetch_attempts")" -eq 3 ] || fail 'a lasting refusal was tried more than three times'
-pass 'a lasting fetch failure gives up after three tries'
+[ "$(wc -l <"$fetch_attempts")" -eq 5 ] || fail 'a lasting refusal was tried more than five times'
+pass 'a lasting fetch failure gives up after five tries'
+
+# A head commit that stays out of reach marks the failure transient: the
+# server may run the commit again, since no repository code ran.
+rm -f "$fetch_attempts" "$work/slept"
+failure_reason=''
+git_proxy=true
+head_sha="$(printf 'd%.0s' {1..40})"
+if fetch_source; then
+    fail 'fetch_source succeeded with a head it could not fetch'
+fi
+[ "$failure_reason" = transient ] || fail "a lost head fetch left reason '$failure_reason'"
+pass 'a head commit that cannot be fetched is a transient failure'
 unset -f git_with_token sleep
+
+# 11. A token exchange the edge refused with a 429, a 5xx or no answer at all
+# is transient; a refusal of the job itself (401, 409) is not.
+for code in 429 502 503 000 401 409; do
+    failure_reason=''
+    ci-post() {
+        if [ "$code" != 000 ]; then
+            printf '%s\n' "$code" >"$3.status"
+        else
+            rm -f "$3.status"
+        fi
+        return 1
+    }
+    oidc_config() {
+        : >"$2"
+    }
+    if exchange_token; then
+        fail "exchange_token accepted an HTTP $code"
+    fi
+    case "$code" in
+        401 | 409) expected='' ;;
+        *) expected=transient ;;
+    esac
+    [ "$failure_reason" = "$expected" ] || fail "an exchange refused with $code left reason '$failure_reason'"
+done
+unset -f ci-post oidc_config
+pass 'a token exchange lost to the edge is transient, a refused job is not'
+
+# 12. The results carry the reason only when there is one.
+state="$work/reason-state"
+mkdir -p "$state"
+CI_RUN_ID=01234567-89ab-cdef-0123-456789abcdef
+status=errored
+last_log=''
+write_empty_summary
+failure_reason=transient
+build_payload
+[ "$(jq -r .reason "$state/results.json")" = transient ] || fail 'a transient failure was reported without its reason'
+failure_reason=''
+build_payload
+[ "$(jq 'has("reason")' "$state/results.json")" = false ] || fail 'a failure without a reason reported one'
+pass 'the results carry reason "transient" only for a transient failure'
 
 echo 'PASS ci-job.test.sh'
