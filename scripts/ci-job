@@ -319,8 +319,21 @@ if ($kind === 'pint') {
 
 // One JSON event per line. A test is counted at its testDone; a hidden test
 // (the synthetic "loading <file>" one) counts only when it did not pass,
-// which is how a compile error shows up. The location prefers root_url and
-// root_line, the declaration inside the test file itself.
+// which is how a compile error shows up. The location is, in order:
+//   1. the test's own url and line when that is a *_test.dart file: in a
+//      bundle entry that imports the test files, root_url is the bundle and
+//      only url names the test file;
+//   2. inside a bundle, the test file its outermost named group is called
+//      after (bundlers name the group by the file's path beside the entry),
+//      at line 0, when that file exists: a test a helper declared, testWidgets
+//      among them, has the helper as url and the bundle as root_url;
+//   3. root_url and root_line, the line inside the suite that reached the
+//      helper.
+//
+// file_timings sums the seconds of every test the reporter placed in a file,
+// hidden setUpAll and tearDownAll included; the load test (the compile) has
+// no url and stays out. A test file can split over shards, so the server sums
+// the shards.
 if ($kind === 'flutter') {
     $handle = fopen($file, 'rb');
 
@@ -332,7 +345,40 @@ if ($kind === 'flutter') {
     $tests = [];
     $errors = [];
     $slow = [];
+    $files = [];
+    $groups = [];
+    $fileKey = '#^(?!(?:.*/)?\.\.(?:/|$))[A-Za-z0-9_][A-Za-z0-9_./-]{0,254}\z#';
     $path = static fn (mixed $url): string => $relative(rawurldecode(preg_replace('#^file://#', '', (string) $url)));
+
+    $locate = static function (array $test) use ($path, &$suites, &$groups, $prefix, $fileKey): array {
+        if (str_ends_with((string) ($test['url'] ?? ''), '_test.dart')) {
+            return [$path($test['url']), (int) ($test['line'] ?? 0)];
+        }
+
+        $root = $path($test['root_url'] ?? $test['url'] ?? $suites[(int) ($test['suiteID'] ?? -1)] ?? '');
+        $outer = '';
+
+        foreach ((array) ($test['groupIDs'] ?? []) as $groupId) {
+            $outer = $groups[(int) $groupId] ?? '';
+
+            if ($outer !== '') {
+                break;
+            }
+        }
+
+        $dir = dirname($root);
+        $named = $dir === '.' ? $outer : $dir.'/'.$outer;
+
+        // The group name came out of the sandbox: only a relative path to an existing test file is taken.
+        if (! str_ends_with($root, '_test.dart')
+            && str_ends_with($outer, '_test.dart')
+            && preg_match($fileKey, $named) === 1
+            && is_file($prefix.$named)) {
+            return [$named, 0];
+        }
+
+        return [$root, (int) ($test['root_line'] ?? $test['line'] ?? 0)];
+    };
 
     while (($line = fgets($handle)) !== false) {
         $event = json_decode($line, true, 64);
@@ -345,14 +391,17 @@ if ($kind === 'flutter') {
 
         if ($type === 'suite') {
             $suites[(int) ($event['suite']['id'] ?? -1)] = (string) ($event['suite']['path'] ?? '');
+        } elseif ($type === 'group') {
+            $groups[(int) ($event['group']['id'] ?? -1)] = (string) ($event['group']['name'] ?? '');
         } elseif ($type === 'testStart') {
             $test = (array) ($event['test'] ?? []);
-            $url = $test['root_url'] ?? $test['url'] ?? $suites[(int) ($test['suiteID'] ?? -1)] ?? '';
+            [$location, $declaredAt] = $locate($test);
             $tests[(int) ($test['id'] ?? -1)] = [
-                'file' => $path($url),
-                'line' => (int) ($test['root_line'] ?? $test['line'] ?? 0),
+                'file' => $location,
+                'line' => $declaredAt,
                 'name' => str_replace($prefix, '', (string) ($test['name'] ?? '')),
                 'started' => (int) ($event['time'] ?? 0),
+                'placed' => isset($test['url']) || isset($test['root_url']),
             ];
         } elseif ($type === 'error') {
             $errors[(int) ($event['testID'] ?? -1)][] = trim(
@@ -361,17 +410,22 @@ if ($kind === 'flutter') {
         } elseif ($type === 'testDone') {
             $id = (int) ($event['testID'] ?? -1);
             $result = (string) ($event['result'] ?? 'success');
+            $test = $tests[$id] ?? ['file' => '', 'line' => 0, 'name' => '', 'started' => null, 'placed' => false];
+
+            // The reporter's times are milliseconds since the run started.
+            $seconds = $test['started'] === null ? 0.0 : max(0, (int) ($event['time'] ?? 0) - $test['started']) / 1000;
+
+            // The server refuses a key that is not a relative path, which would cost the whole result.
+            if ($test['placed'] && preg_match($fileKey, $test['file']) === 1) {
+                $files[$test['file']] = ($files[$test['file']] ?? 0.0) + $seconds;
+            }
 
             if (($event['hidden'] ?? false) === true && $result === 'success') {
                 continue;
             }
 
             $summary['counts']['tests']++;
-            $test = $tests[$id] ?? ['file' => '', 'line' => 0, 'name' => '', 'started' => null];
             $message = implode("\n\n", $errors[$id] ?? []);
-
-            // The reporter's times are milliseconds since the run started.
-            $seconds = $test['started'] === null ? 0.0 : max(0, (int) ($event['time'] ?? 0) - $test['started']) / 1000;
 
             if ($seconds >= 2.0 && $test['name'] !== '') {
                 $slow[] = [
@@ -397,7 +451,13 @@ if ($kind === 'flutter') {
     fclose($handle);
 
     usort($slow, static fn (array $a, array $b): int => $b['seconds'] <=> $a['seconds']);
+    arsort($files);
+
     $summary['slow_tests'] = array_slice($slow, 0, 50);
+    $summary['file_timings'] = (object) array_map(
+        static fn (float $total): float => round($total, 3),
+        array_slice($files, 0, 5000, true),
+    );
 }
 
 echo json_encode($summary, JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
@@ -856,6 +916,8 @@ build_payload() {
                 then {slow_tests: $s.slow_tests} else {} end)
             + (if $max_failures > 0 and ($s.class_timings // {} | length) > 0
                 then {class_timings: $s.class_timings} else {} end)
+            + (if $max_failures > 0 and ($s.file_timings // {} | length) > 0
+                then {file_timings: $s.file_timings} else {} end)
             + (if $with_coverage == 1 and ($coverage | length) > 0
                 then {coverage_gz: $coverage} else {} end)
             + (if $reason == "" then {} else {reason: $reason} end)
