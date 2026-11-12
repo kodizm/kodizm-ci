@@ -153,6 +153,54 @@ slow="$(jq -c '.slow_tests' "$state/summary.json")"
     || fail "flutter slow tests are $slow"
 pass 'flutter slow tests come from the reporter times'
 
+# A bundle entry (test/bundle_0.g.dart imports each *_test.dart and runs its
+# main inside a group) is the suite, so root_url names the bundle; a test's own
+# url still names the test file that declared it. The events are what
+# `flutter test --file-reporter json:` wrote for such a bundle. Seconds sum per
+# file, a hidden setUpAll included and the suite's load (its compile) left out.
+report="$work/flutter-bundle.json"
+bundle="file://$tree/test/bundle_0.g.dart"
+cat >"$report" <<JSON
+{"suite":{"id":0,"platform":"vm","path":"$tree/test/bundle_0.g.dart"},"type":"suite","time":0}
+{"test":{"id":1,"name":"loading $tree/test/bundle_0.g.dart","suiteID":0,"groupIDs":[],"metadata":{"skip":false,"skipReason":null},"line":null,"column":null,"url":null},"type":"testStart","time":0}
+{"testID":1,"result":"success","skipped":false,"hidden":true,"type":"testDone","time":5000}
+{"group":{"id":2,"suiteID":0,"parentID":null,"name":"","metadata":{"skip":false,"skipReason":null},"testCount":5,"line":null,"column":null,"url":null},"type":"group","time":5001}
+{"group":{"id":3,"suiteID":0,"parentID":2,"name":"app/a_test.dart","metadata":{"skip":false,"skipReason":null},"testCount":3,"line":5,"column":3,"url":"$bundle"},"type":"group","time":5001}
+{"test":{"id":4,"name":"app/a_test.dart (setUpAll)","suiteID":0,"groupIDs":[2,3],"metadata":{"skip":false,"skipReason":null},"line":4,"column":3,"url":"file://$tree/test/app/a_test.dart","root_line":5,"root_column":3,"root_url":"$bundle"},"type":"testStart","time":5000}
+{"testID":4,"result":"success","skipped":false,"hidden":true,"type":"testDone","time":5700}
+{"test":{"id":5,"name":"app/a_test.dart nested slow one","suiteID":0,"groupIDs":[2,3],"metadata":{"skip":false,"skipReason":null},"line":7,"column":5,"url":"file://$tree/test/app/a_test.dart","root_line":5,"root_column":3,"root_url":"$bundle"},"type":"testStart","time":5700}
+{"testID":5,"result":"success","skipped":false,"hidden":false,"type":"testDone","time":8000}
+{"test":{"id":6,"name":"app/a_test.dart via helper","suiteID":0,"groupIDs":[2,3],"metadata":{"skip":false,"skipReason":null},"line":2,"column":3,"url":"file://$tree/test/support_helper.dart","root_line":5,"root_column":3,"root_url":"$bundle"},"type":"testStart","time":8000}
+{"testID":6,"result":"success","skipped":false,"hidden":false,"type":"testDone","time":8300}
+{"test":{"id":7,"name":"app/a_test.dart (tearDownAll)","suiteID":0,"groupIDs":[2,3],"metadata":{"skip":false,"skipReason":null},"line":null,"column":null,"url":null},"type":"testStart","time":8300}
+{"testID":7,"result":"success","skipped":false,"hidden":true,"type":"testDone","time":8310}
+{"test":{"id":8,"name":"b_test.dart fails","suiteID":0,"groupIDs":[2,9],"metadata":{"skip":false,"skipReason":null},"line":3,"column":3,"url":"file://$tree/test/b_test.dart","root_line":6,"root_column":3,"root_url":"$bundle"},"type":"testStart","time":8310}
+{"testID":8,"error":"Expected: <2>\n  Actual: <1>","stackTrace":"test/b_test.dart 3:20","isFailure":true,"type":"error","time":8329}
+{"testID":8,"result":"failure","skipped":false,"hidden":false,"type":"testDone","time":8330}
+{"success":false,"type":"done","time":8340}
+JSON
+summarise flutter "$report" || fail 'summarise flutter exited non-zero on the bundle report'
+slow="$(jq -c '.slow_tests' "$state/summary.json")"
+expected='[{"name":"app/a_test.dart nested slow one","file":"test/app/a_test.dart","line":7,"seconds":2.3}]'
+[ "$slow" = "$expected" ] || fail "bundled slow tests are $slow"
+failures="$(jq -c '[.failures[] | [.file, .line, .name]]' "$state/summary.json")"
+[ "$failures" = '[["test/b_test.dart",3,"b_test.dart fails"]]' ] || fail "bundled failures are $failures"
+pass 'a bundled test points at the test file and line that declared it, a helper test at the bundle'
+
+timings="$(jq -c '.file_timings' "$state/summary.json")"
+jq -e '.file_timings == {"test/app/a_test.dart": 3, "test/bundle_0.g.dart": 0.3, "test/b_test.dart": 0.02}' \
+    "$state/summary.json" >/dev/null || fail "flutter file timings are $timings"
+[ "$(jq -r '.file_timings | keys_unsorted[0]' "$state/summary.json")" = test/app/a_test.dart ] \
+    || fail "flutter file timings are not slowest first: $timings"
+pass 'flutter file timings sum each test file, setUpAll in and the load out, slowest first'
+
+status=failed
+last_log='test'
+build_payload
+jq -e '.file_timings["test/app/a_test.dart"] == 3' "$state/results.json" >/dev/null \
+    || fail 'the results payload lost the file timings'
+pass 'the results payload carries the file timings'
+
 # The private log gets each test class's summed seconds, slowest first, so
 # the shard split can be measured against real class durations.
 report="$work/junit.xml"
