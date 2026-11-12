@@ -319,11 +319,16 @@ if ($kind === 'pint') {
 
 // One JSON event per line. A test is counted at its testDone; a hidden test
 // (the synthetic "loading <file>" one) counts only when it did not pass,
-// which is how a compile error shows up. The location is the test's own url
-// and line when that is a *_test.dart file: in a bundle entry that imports
-// the test files, root_url is the bundle and only url names the test file.
-// Otherwise it prefers root_url and root_line, the line inside the suite
-// that reached a helper which declared the test.
+// which is how a compile error shows up. The location is, in order:
+//   1. the test's own url and line when that is a *_test.dart file: in a
+//      bundle entry that imports the test files, root_url is the bundle and
+//      only url names the test file;
+//   2. inside a bundle, the test file its outermost named group is called
+//      after (bundlers name the group by the file's path beside the entry),
+//      at line 0, when that file exists: a test a helper declared, testWidgets
+//      among them, has the helper as url and the bundle as root_url;
+//   3. root_url and root_line, the line inside the suite that reached the
+//      helper.
 //
 // file_timings sums the seconds of every test the reporter placed in a file,
 // hidden setUpAll and tearDownAll included; the load test (the compile) has
@@ -341,8 +346,39 @@ if ($kind === 'flutter') {
     $errors = [];
     $slow = [];
     $files = [];
-    $fileKey = '#^(?!(?:.*/)?\.\.(?:/|$))[A-Za-z0-9_][A-Za-z0-9_./-]{0,254}$#';
+    $groups = [];
+    $fileKey = '#^(?!(?:.*/)?\.\.(?:/|$))[A-Za-z0-9_][A-Za-z0-9_./-]{0,254}\z#';
     $path = static fn (mixed $url): string => $relative(rawurldecode(preg_replace('#^file://#', '', (string) $url)));
+
+    $locate = static function (array $test) use ($path, &$suites, &$groups, $prefix, $fileKey): array {
+        if (str_ends_with((string) ($test['url'] ?? ''), '_test.dart')) {
+            return [$path($test['url']), (int) ($test['line'] ?? 0)];
+        }
+
+        $root = $path($test['root_url'] ?? $test['url'] ?? $suites[(int) ($test['suiteID'] ?? -1)] ?? '');
+        $outer = '';
+
+        foreach ((array) ($test['groupIDs'] ?? []) as $groupId) {
+            $outer = $groups[(int) $groupId] ?? '';
+
+            if ($outer !== '') {
+                break;
+            }
+        }
+
+        $dir = dirname($root);
+        $named = $dir === '.' ? $outer : $dir.'/'.$outer;
+
+        // The group name came out of the sandbox: only a relative path to an existing test file is taken.
+        if (! str_ends_with($root, '_test.dart')
+            && str_ends_with($outer, '_test.dart')
+            && preg_match($fileKey, $named) === 1
+            && is_file($prefix.$named)) {
+            return [$named, 0];
+        }
+
+        return [$root, (int) ($test['root_line'] ?? $test['line'] ?? 0)];
+    };
 
     while (($line = fgets($handle)) !== false) {
         $event = json_decode($line, true, 64);
@@ -355,15 +391,14 @@ if ($kind === 'flutter') {
 
         if ($type === 'suite') {
             $suites[(int) ($event['suite']['id'] ?? -1)] = (string) ($event['suite']['path'] ?? '');
+        } elseif ($type === 'group') {
+            $groups[(int) ($event['group']['id'] ?? -1)] = (string) ($event['group']['name'] ?? '');
         } elseif ($type === 'testStart') {
             $test = (array) ($event['test'] ?? []);
-            $declared = str_ends_with((string) ($test['url'] ?? ''), '_test.dart');
-            $url = $declared
-                ? $test['url']
-                : $test['root_url'] ?? $test['url'] ?? $suites[(int) ($test['suiteID'] ?? -1)] ?? '';
+            [$location, $declaredAt] = $locate($test);
             $tests[(int) ($test['id'] ?? -1)] = [
-                'file' => $path($url),
-                'line' => (int) ($declared ? $test['line'] ?? 0 : $test['root_line'] ?? $test['line'] ?? 0),
+                'file' => $location,
+                'line' => $declaredAt,
                 'name' => str_replace($prefix, '', (string) ($test['name'] ?? '')),
                 'started' => (int) ($event['time'] ?? 0),
                 'placed' => isset($test['url']) || isset($test['root_url']),

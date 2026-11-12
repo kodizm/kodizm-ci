@@ -160,6 +160,8 @@ pass 'flutter slow tests come from the reporter times'
 # file, a hidden setUpAll included and the suite's load (its compile) left out.
 report="$work/flutter-bundle.json"
 bundle="file://$tree/test/bundle_0.g.dart"
+mkdir -p "$tree/test/app"
+touch "$tree/test/app/a_test.dart" "$tree/test/b_test.dart"
 cat >"$report" <<JSON
 {"suite":{"id":0,"platform":"vm","path":"$tree/test/bundle_0.g.dart"},"type":"suite","time":0}
 {"test":{"id":1,"name":"loading $tree/test/bundle_0.g.dart","suiteID":0,"groupIDs":[],"metadata":{"skip":false,"skipReason":null},"line":null,"column":null,"url":null},"type":"testStart","time":0}
@@ -172,32 +174,41 @@ cat >"$report" <<JSON
 {"testID":5,"result":"success","skipped":false,"hidden":false,"type":"testDone","time":8000}
 {"test":{"id":6,"name":"app/a_test.dart via helper","suiteID":0,"groupIDs":[2,3],"metadata":{"skip":false,"skipReason":null},"line":2,"column":3,"url":"file://$tree/test/support_helper.dart","root_line":5,"root_column":3,"root_url":"$bundle"},"type":"testStart","time":8000}
 {"testID":6,"result":"success","skipped":false,"hidden":false,"type":"testDone","time":8300}
-{"test":{"id":7,"name":"app/a_test.dart (tearDownAll)","suiteID":0,"groupIDs":[2,3],"metadata":{"skip":false,"skipReason":null},"line":null,"column":null,"url":null},"type":"testStart","time":8300}
-{"testID":7,"result":"success","skipped":false,"hidden":true,"type":"testDone","time":8310}
-{"test":{"id":8,"name":"b_test.dart fails","suiteID":0,"groupIDs":[2,9],"metadata":{"skip":false,"skipReason":null},"line":3,"column":3,"url":"file://$tree/test/b_test.dart","root_line":6,"root_column":3,"root_url":"$bundle"},"type":"testStart","time":8310}
-{"testID":8,"error":"Expected: <2>\n  Actual: <1>","stackTrace":"test/b_test.dart 3:20","isFailure":true,"type":"error","time":8329}
-{"testID":8,"result":"failure","skipped":false,"hidden":false,"type":"testDone","time":8330}
-{"success":false,"type":"done","time":8340}
+{"test":{"id":10,"name":"app/a_test.dart renders","suiteID":0,"groupIDs":[2,3],"metadata":{"skip":false,"skipReason":null},"line":174,"column":5,"url":"package:flutter_test/src/widget_tester.dart","root_line":5,"root_column":3,"root_url":"$bundle"},"type":"testStart","time":8300}
+{"testID":10,"error":"No widget found","stackTrace":"test/app/a_test.dart 12:7","isFailure":true,"type":"error","time":8399}
+{"testID":10,"result":"failure","skipped":false,"hidden":false,"type":"testDone","time":8400}
+{"group":{"id":11,"suiteID":0,"parentID":2,"name":"missing_test.dart","metadata":{"skip":false,"skipReason":null},"testCount":1,"line":7,"column":3,"url":"$bundle"},"type":"group","time":8400}
+{"test":{"id":12,"name":"missing_test.dart renders","suiteID":0,"groupIDs":[2,11],"metadata":{"skip":false,"skipReason":null},"line":174,"column":5,"url":"package:flutter_test/src/widget_tester.dart","root_line":7,"root_column":3,"root_url":"$bundle"},"type":"testStart","time":8400}
+{"testID":12,"result":"success","skipped":false,"hidden":false,"type":"testDone","time":8500}
+{"test":{"id":7,"name":"app/a_test.dart (tearDownAll)","suiteID":0,"groupIDs":[2,3],"metadata":{"skip":false,"skipReason":null},"line":null,"column":null,"url":null},"type":"testStart","time":8500}
+{"testID":7,"result":"success","skipped":false,"hidden":true,"type":"testDone","time":8510}
+{"group":{"id":9,"suiteID":0,"parentID":2,"name":"b_test.dart","metadata":{"skip":false,"skipReason":null},"testCount":1,"line":6,"column":3,"url":"$bundle"},"type":"group","time":8510}
+{"test":{"id":8,"name":"b_test.dart fails","suiteID":0,"groupIDs":[2,9],"metadata":{"skip":false,"skipReason":null},"line":3,"column":3,"url":"file://$tree/test/b_test.dart","root_line":6,"root_column":3,"root_url":"$bundle"},"type":"testStart","time":8510}
+{"testID":8,"error":"Expected: <2>\n  Actual: <1>","stackTrace":"test/b_test.dart 3:20","isFailure":true,"type":"error","time":8529}
+{"testID":8,"result":"failure","skipped":false,"hidden":false,"type":"testDone","time":8530}
+{"success":false,"type":"done","time":8540}
 JSON
 summarise flutter "$report" || fail 'summarise flutter exited non-zero on the bundle report'
 slow="$(jq -c '.slow_tests' "$state/summary.json")"
 expected='[{"name":"app/a_test.dart nested slow one","file":"test/app/a_test.dart","line":7,"seconds":2.3}]'
 [ "$slow" = "$expected" ] || fail "bundled slow tests are $slow"
 failures="$(jq -c '[.failures[] | [.file, .line, .name]]' "$state/summary.json")"
-[ "$failures" = '[["test/b_test.dart",3,"b_test.dart fails"]]' ] || fail "bundled failures are $failures"
-pass 'a bundled test points at the test file and line that declared it, a helper test at the bundle'
+expected='[["test/app/a_test.dart",0,"app/a_test.dart renders"],["test/b_test.dart",3,"b_test.dart fails"]]'
+[ "$failures" = "$expected" ] || fail "bundled failures are $failures"
+pass 'a bundled test points at its test file: the declaring line, or line 0 for a helper such as testWidgets'
 
 timings="$(jq -c '.file_timings' "$state/summary.json")"
-jq -e '.file_timings == {"test/app/a_test.dart": 3, "test/bundle_0.g.dart": 0.3, "test/b_test.dart": 0.02}' \
-    "$state/summary.json" >/dev/null || fail "flutter file timings are $timings"
+expected='{"test/app/a_test.dart": 3.4, "test/bundle_0.g.dart": 0.1, "test/b_test.dart": 0.02}'
+jq -e ".file_timings == $expected" "$state/summary.json" >/dev/null \
+    || fail "flutter file timings are $timings"
 [ "$(jq -r '.file_timings | keys_unsorted[0]' "$state/summary.json")" = test/app/a_test.dart ] \
     || fail "flutter file timings are not slowest first: $timings"
-pass 'flutter file timings sum each test file, setUpAll in and the load out, slowest first'
+pass 'file timings sum each test file (setUpAll in, load out), slowest first; an unknown group stays on the bundle'
 
 status=failed
 last_log='test'
 build_payload
-jq -e '.file_timings["test/app/a_test.dart"] == 3' "$state/results.json" >/dev/null \
+jq -e '.file_timings["test/app/a_test.dart"] == 3.4' "$state/results.json" >/dev/null \
     || fail 'the results payload lost the file timings'
 pass 'the results payload carries the file timings'
 
