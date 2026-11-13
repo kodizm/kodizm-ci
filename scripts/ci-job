@@ -527,9 +527,10 @@ PHP
 # computes the same plan from the same listing and timings: the classes the
 # listing names, slowest first, each onto the least loaded shard (ties to the
 # lower shard). A class without a timing counts as the median of the listed
-# ones; a timed class the listing lacks is gone and is skipped. Fails when the
-# listing names no class or the timings are unreadable, so the caller falls
-# back to round-robin. Data only, like summarise.
+# ones; a timed class the listing lacks is gone and is skipped. An empty map
+# weighs every class the same, which deals them in listing order. Fails when
+# the listing names no class or the timings are unreadable, so the caller
+# falls back to paratest's sequential split. Data only, like summarise.
 plan_shard() {
     php -d memory_limit=1G -- "$1" "$2" "$3" "$4" <<'PHP'
 <?php
@@ -1638,36 +1639,45 @@ run_warm() {
 # Sets shard_args to this shard's selection and shard_mode to how it was
 # chosen. Every shard of a run must pick the same partition, or a class could
 # run nowhere:
-#   - no class timings: round-robin, as every shard sees the same response;
-#   - timings, but this shard's listing failed: the whole suite (shard_mode
-#     whole), because the other shards may have planned by duration, and a
-#     repeated test is cheaper than a skipped one;
-#   - timings and a listing: plan_shard decides from data every shard shares,
-#     so a refusal (a filter too large to compile, too few classes) is the same
-#     on every shard and they all take round-robin together.
+#   - this shard's listing failed: the whole suite (shard_mode whole), because
+#     the other shards may have planned, and a repeated test is cheaper than a
+#     skipped one;
+#   - a listing: plan_shard deals the listed classes by duration, or, when the
+#     token carried no class timings, by count (every class weighs the same).
+#     It decides from data every shard shares, so a refusal (a filter too large
+#     to compile, too few classes) is the same on every shard and they all take
+#     paratest's sequential split together.
+# Never paratest's round-robin split: it deals test methods but hands its
+# workers whole files, so nearly every class lands on every shard and each
+# shard runs about the whole suite. The sequential split slices the same method
+# list into contiguous runs, so a shard repeats at most the class it starts in
+# and the class it ends in.
 # The listing runs repository code, so it runs sandboxed; it is planning
 # input, not evidence, so it never reaches the uploaded logs.
 shard_split() {
     local filter
+    local timings="$state/class-timings.json"
+    local basis='by duration'
 
-    shard_args=("--shard=$shard/$shards" --shard-test-distribution=round-robin)
-    shard_mode=round-robin
+    shard_args=("--shard=$shard/$shards" --shard-test-distribution=sequential)
+    shard_mode=sequential
 
-    if [ "$(jq 'length' "$state/class-timings.json" 2>/dev/null || echo 0)" -eq 0 ]; then
-        say 'shards: round-robin'
-        return 0
+    if [ "$(jq 'length' "$timings" 2>/dev/null || echo 0)" -eq 0 ]; then
+        timings="$state/no-class-timings.json"
+        basis='by class count'
+        printf '{}' >"$timings"
     fi
 
     if ! stack_sandboxed list-tests -- php vendor/bin/phpunit --list-tests; then
         shard_args=()
         shard_mode=whole
         say 'shards: the listing failed, this shard runs the whole suite'
-    elif filter="$(plan_shard "$state/list-tests.log" "$state/class-timings.json" "$shard" "$shards")"; then
+    elif filter="$(plan_shard "$state/list-tests.log" "$timings" "$shard" "$shards")"; then
         shard_args=(--filter "$filter")
         shard_mode=planned
-        say 'shards: by duration'
+        say "shards: ${basis}"
     else
-        say 'shards: round-robin'
+        say 'shards: sequential'
     fi
 
     rm -f "$state/list-tests.log"

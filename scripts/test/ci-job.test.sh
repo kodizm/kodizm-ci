@@ -310,6 +310,17 @@ second="$(plan_shard "$list" "$work/plan-timings.json" 2 2)" || fail 'plan_shard
     || fail "shard 2 filter is $second"
 pass 'plan_shard splits by duration, counts an unknown class as the median and skips a gone class'
 
+# With no timings every class weighs the same: whole classes, dealt in listing
+# order, so each class runs on exactly one shard.
+printf '{}' >"$work/no-timings.json"
+first="$(plan_shard "$list" "$work/no-timings.json" 1 2)" || fail 'plan_shard refused shard 1 without timings'
+second="$(plan_shard "$list" "$work/no-timings.json" 2 2)" || fail 'plan_shard refused shard 2 without timings'
+[ "$first" = '{^(?:Tests\\Unit\\AaTest|Tests\\Feature\\CcTest|Tests\\Feature\\NewTest)::}' ] \
+    || fail "shard 1 filter without timings is $first"
+[ "$second" = '{^(?:Tests\\Unit\\BbTest|Tests\\Feature\\DdTest)::}' ] \
+    || fail "shard 2 filter without timings is $second"
+pass 'plan_shard deals whole classes by count when there are no timings'
+
 printf 'Available tests:\n' >"$work/empty-list.txt"
 if plan_shard "$work/empty-list.txt" "$work/plan-timings.json" 1 2 >/dev/null; then
     fail 'plan_shard planned an empty list'
@@ -333,6 +344,33 @@ for index in 1 2; do
     fi
 done
 pass 'plan_shard refuses an empty list, missing timings, too few classes or a filter PCRE cannot compile'
+
+# Without class timings shard_split still plans whole classes, and when the
+# plan is refused it takes paratest's sequential split, never round-robin:
+# round-robin deals methods but runs whole files, so every shard ran about the
+# whole suite.
+(
+    stack_sandboxed() {
+        cp "$listing" "$state/list-tests.log"
+    }
+    shard=2
+    shards=2
+    printf '{}' >"$state/class-timings.json"
+
+    listing="$list"
+    shard_split
+    [ "$shard_mode" = planned ] || fail "shard_split without timings chose $shard_mode"
+    [ "${shard_args[*]}" = '--filter {^(?:Tests\\Unit\\BbTest|Tests\\Feature\\DdTest)::}' ] \
+        || fail "shard_split without timings passed ${shard_args[*]}"
+
+    listing="$work/huge-list.txt"
+    shard_split
+    [ "$shard_mode" = sequential ] || fail "a refused plan chose $shard_mode"
+    [ "${shard_args[*]}" = '--shard=2/2 --shard-test-distribution=sequential' ] \
+        || fail "a refused plan passed ${shard_args[*]}"
+)
+rm -f "$state/class-timings.json" "$state/no-class-timings.json"
+pass 'shard_split plans whole classes without timings and falls back to the sequential split'
 
 # Every sandboxed command's log ends with how long it took, and the command's
 # own exit code survives the bookkeeping.
